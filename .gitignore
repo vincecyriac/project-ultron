@@ -1,0 +1,22 @@
+# Credentials
+.env
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local state and session handles
+.ultron_session.json
+.session_handle.json
+ultron_history.jsonl
+
+# Temporary media captures
+*.jpg
+*.png
+*.wav
+*.pcm
+
+# Virtual Environment
+.venv/

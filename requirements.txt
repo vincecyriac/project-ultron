@@ -1,0 +1,8 @@
+google-genai
+opencv-python
+pyautogui
+pillow
+python-dotenv
+pyaudio
+pyobjc-core
+pyobjc
