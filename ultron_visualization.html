@@ -1,28 +1,105 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<title>How AI Works</title>
-<style>
-    body { font-family: 'Helvetica Neue', Helvetica, sans-serif; background-color: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-    .container { text-align: center; border: 2px solid #333; padding: 40px; border-radius: 15px; background: #1e1e1e; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-    h1 { color: #4CAF50; margin-bottom: 30px; }
-    .diagram { display: flex; justify-content: space-around; width: 600px; margin-top: 20px; }
-    .box { border: 2px solid #4CAF50; padding: 20px; border-radius: 10px; width: 150px; background: #2e2e2e; transition: transform 0.3s; }
-    .box:hover { transform: scale(1.05); background: #383838; }
-    .arrow { font-size: 2em; color: #757575; align-self: center; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Modern Ultron Visualizer</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #010101;
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        .container {
+            position: relative;
+            width: 400px;
+            height: 400px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* Ambient Glow */
+        .glow {
+            position: absolute;
+            width: 150px;
+            height: 150px;
+            background: radial-gradient(circle, rgba(0,255,255,0.7) 0%, rgba(0,255,255,0) 70%);
+            border-radius: 50%;
+            filter: blur(15px);
+            animation: ambientPulse 4s infinite alternate;
+        }
+
+        .visualizer-bars {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            z-index: 10;
+        }
+
+        .bar {
+            width: 10px;
+            height: 20px;
+            background: linear-gradient(to bottom, #00ffff, #008080);
+            border-radius: 5px;
+            animation: standBy 1.5s infinite ease-in-out;
+            box-shadow: 0 0 15px rgba(0, 255, 255, 0.5);
+        }
+
+        /* Animation for different bars */
+        .bar:nth-child(1) { animation-delay: 0.1s; height: 30px; }
+        .bar:nth-child(2) { animation-delay: 0.2s; height: 50px; }
+        .bar:nth-child(3) { animation-delay: 0.3s; height: 70px; }
+        .bar:nth-child(4) { animation-delay: 0.4s; height: 50px; }
+        .bar:nth-child(5) { animation-delay: 0.5s; height: 30px; }
+
+        @keyframes standBy {
+            0%, 100% { transform: scaleY(1); opacity: 0.8; }
+            50% { transform: scaleY(1.8); opacity: 1; }
+        }
+
+        @keyframes ambientPulse {
+            0% { transform: scale(1); opacity: 0.5; }
+            100% { transform: scale(1.5); opacity: 0.9; }
+        }
+
+        /* Status Text */
+        .status {
+            position: absolute;
+            bottom: 20px;
+            color: #00ffff;
+            letter-spacing: 2px;
+            font-size: 14px;
+            text-transform: uppercase;
+            text-shadow: 0 0 5px #00ffff;
+            animation: textFlicker 2s infinite;
+        }
+
+        @keyframes textFlicker {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+            75% { opacity: 0.9; }
+        }
+
+    </style>
 </head>
 <body>
     <div class="container">
-        <h1>Understanding AI</h1>
-        <p>Artificial Intelligence mimics human thought to solve complex problems.</p>
-        <div class="diagram">
-            <div class="box">Data Input</div>
-            <div class="arrow">→</div>
-            <div class="box">Processing & Analysis (Machine Learning)</div>
-            <div class="arrow">→</div>
-            <div class="box">Intelligent Output/Action</div>
+        <div class="glow"></div>
+        <div class="visualizer-bars">
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
         </div>
+        <div class="status">LISTENING</div>
     </div>
 </body>
 </html>

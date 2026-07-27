@@ -22,7 +22,6 @@ def capture_screen(output_size=(768, 768)):
         screenshot.save(buffer, format="JPEG", quality=80)
         return buffer.getvalue()
     except Exception as e:
-        print(f"[sentry_vision] Screen capture failed: {e}")
         return None
 
 def capture_webcam(output_size=(768, 768)):
@@ -35,7 +34,6 @@ def capture_webcam(output_size=(768, 768)):
         # 0 is usually the default webcam (e.g. MacBook FaceTime HD Camera)
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            print("[sentry_vision] Default webcam could not be opened.")
             return None
         
         # Warm up the camera (read a few frames for auto-exposure)
@@ -44,7 +42,6 @@ def capture_webcam(output_size=(768, 768)):
             
         ret, frame = cap.read()
         if not ret:
-            print("[sentry_vision] Failed to grab frame from webcam.")
             return None
             
         # Convert BGR (OpenCV default) to RGB
@@ -59,7 +56,6 @@ def capture_webcam(output_size=(768, 768)):
         image.save(buffer, format="JPEG", quality=80)
         return buffer.getvalue()
     except Exception as e:
-        print(f"[sentry_vision] Webcam capture failed: {e}")
         return None
     finally:
         if cap is not None:
@@ -95,7 +91,6 @@ class PersistentWebcam:
             image.save(buffer, format="JPEG", quality=80)
             return buffer.getvalue()
         except Exception as e:
-            print(f"[sentry_vision] Webcam read failed: {e}")
             return None
             
     def stop(self):

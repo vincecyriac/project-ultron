@@ -1,19 +1,58 @@
 import os
-os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 import sys
 import json
 import asyncio
-import pyaudio
-import cv2
+import contextlib
+import datetime
 try:
-    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
-except:
-    pass
+    import psutil
+except ImportError:
+    psutil = None
+
+@contextlib.contextmanager
+def suppress_c_stdout_stderr():
+    """A context manager that redirects standard output and standard error at the OS level to suppress C-level warnings."""
+    try:
+        null_fd = os.open(os.devnull, os.O_RDWR)
+        save_stdout = os.dup(1)
+        save_stderr = os.dup(2)
+        os.dup2(null_fd, 1)
+        os.dup2(null_fd, 2)
+        yield
+    except Exception:
+        yield
+    finally:
+        try:
+            os.dup2(save_stdout, 1)
+            os.dup2(save_stderr, 2)
+            os.close(save_stdout)
+            os.close(save_stderr)
+            os.close(null_fd)
+        except:
+            pass
+
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+with suppress_c_stdout_stderr():
+    import pyaudio
+    import cv2
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except:
+        pass
 import numpy as np
 import unicodedata
-import tty
-import termios
 import ssl
+import threading
+import websockets
+from Foundation import NSObject, NSURL
+from AppKit import (
+    NSApplication, NSWindow, NSBackingStoreBuffered,
+    NSRect, NSPoint, NSSize, NSTitledWindowMask, NSClosableWindowMask,
+    NSMiniaturizableWindowMask, NSResizableWindowMask, NSColor,
+    NSVisualEffectView, NSVisualEffectMaterialDark, NSVisualEffectBlendingModeBehindWindow,
+    NSVisualEffectStateActive, NSLayoutConstraint
+)
+from WebKit import WKWebView, WKWebViewConfiguration, WKWebsiteDataStore
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -36,7 +75,98 @@ HISTORY_LOG_FILE = "ultron_history.jsonl"
 MEMORY_FILE = "ultron_memory.json"
 
 # Model selection: defaults to gemini-3.1-flash-live-preview, customizable via env
-MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
+CURRENT_MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
+SUPPORTED_MODELS = [
+    "gemini-3.1-flash-live-preview",
+    "gemini-2.5-flash-live-preview",
+    "gemini-2.0-flash-exp",
+    "gemini-2.0-flash-realtime-exp"
+]
+
+def switch_model_session(new_model: str) -> str:
+    global CURRENT_MODEL_ID, model_switch_event
+    if new_model not in SUPPORTED_MODELS:
+        SUPPORTED_MODELS.append(new_model)
+    CURRENT_MODEL_ID = new_model
+    if gui:
+        gui.add_log(f"Model switch requested -> {new_model}")
+        gui.broadcast({"type": "model_update", "value": new_model, "models": SUPPORTED_MODELS})
+    model_switch_event.set()
+    return f"Model successfully switched to '{new_model}'. Reconnecting live session..."
+
+# Voice configuration
+CURRENT_VOICE = "Puck"
+SUPPORTED_VOICES = ["Puck", "Charon", "Kore", "Fenrir", "Aoede"]
+
+mic_muted = False
+
+def switch_voice_session(new_voice: str) -> str:
+    global CURRENT_VOICE, model_switch_event
+    if new_voice not in SUPPORTED_VOICES:
+        SUPPORTED_VOICES.append(new_voice)
+    CURRENT_VOICE = new_voice
+    if gui:
+        gui.add_log(f"Voice switch requested -> {new_voice}")
+        gui.broadcast({"type": "voice_update", "value": new_voice, "voices": SUPPORTED_VOICES})
+    model_switch_event.set()
+    return f"Voice successfully switched to '{new_voice}'. Reconnecting live session..."
+
+def toggle_mic_mute() -> bool:
+    global mic_muted
+    mic_muted = not mic_muted
+    if gui:
+        gui.add_log(f"Microphone {'MUTED' if mic_muted else 'UNMUTED'}")
+        gui.broadcast({"type": "mute_update", "value": mic_muted})
+    return mic_muted
+
+def export_session_history(format_type: str = "markdown") -> str:
+    """Export ultron_history.jsonl into a formatted Markdown report ultron_history_export.md."""
+    if not os.path.exists(HISTORY_LOG_FILE):
+        return "No history log file found."
+    
+    export_filename = "ultron_history_export.md"
+    try:
+        entries = []
+        with open(HISTORY_LOG_FILE, "r") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        entries.append(json.loads(line))
+                    except:
+                        pass
+        
+        md_lines = [
+            "# Project Ultron Session History Export\n",
+            f"**Export Time**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+            f"**Total Events**: {len(entries)}\n\n---\n"
+        ]
+        for idx, entry in enumerate(entries, 1):
+            event_type = entry.get("type", "event")
+            timestamp = entry.get("timestamp", "")
+            data = entry.get("data", {})
+            md_lines.append(f"### {idx}. [{timestamp}] `{event_type}`\n")
+            md_lines.append(f"```json\n{json.dumps(data, indent=2)}\n```\n\n")
+            
+        with open(export_filename, "w") as ef:
+            ef.write("\n".join(md_lines))
+            
+        if gui:
+            gui.add_log(f"Exported session history to {export_filename}")
+        return f"Successfully exported {len(entries)} events to '{export_filename}'."
+    except Exception as e:
+        return f"Error exporting session history: {e}"
+
+def delete_memory_fact(key: str) -> str:
+    """Delete a memory fact by key from ultron_memory.json."""
+    memory = load_memory()
+    if key in memory:
+        del memory[key]
+        save_memory(memory)
+        if gui:
+            gui.broadcast({"type": "memory_update", "value": memory})
+        return f"Fact '{key}' deleted from memory."
+    return f"Key '{key}' not found in memory."
+
 
 # Audio configuration
 FORMAT = pyaudio.paInt16
@@ -76,127 +206,105 @@ def visual_ljust(text: str, width: int) -> str:
 
 
 
-class UltronTerminalGUI:
+ui_clients = set()
+ws_input_queue = asyncio.Queue()
+
+async def ws_handler(websocket):
+    global ui_clients, ws_input_queue
+    ui_clients.add(websocket)
+    try:
+        if gui:
+            await websocket.send(json.dumps({"type": "status", "value": gui.status}))
+            for log in gui.logs:
+                await websocket.send(json.dumps({"type": "log", "value": log}))
+            await websocket.send(json.dumps({
+                "type": "senses",
+                "screen": "STREAMING" if screen_stream_active else "READY",
+                "webcam": "STREAMING" if camera_stream_active else "READY"
+            }))
+            await websocket.send(json.dumps({
+                "type": "model_update",
+                "value": CURRENT_MODEL_ID,
+                "models": SUPPORTED_MODELS
+            }))
+            await websocket.send(json.dumps({
+                "type": "voice_update",
+                "value": CURRENT_VOICE,
+                "voices": SUPPORTED_VOICES
+            }))
+            await websocket.send(json.dumps({
+                "type": "mute_update",
+                "value": mic_muted
+            }))
+            await websocket.send(json.dumps({
+                "type": "memory_update",
+                "value": load_memory()
+            }))
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                if data.get("type") == "input":
+                    val = data.get("value")
+                    await ws_input_queue.put(val)
+                elif data.get("type") == "switch_model":
+                    new_model = data.get("value")
+                    if new_model:
+                        switch_model_session(new_model)
+                elif data.get("type") == "switch_voice":
+                    new_voice = data.get("value")
+                    if new_voice:
+                        switch_voice_session(new_voice)
+                elif data.get("type") == "toggle_mute":
+                    toggle_mic_mute()
+                elif data.get("type") == "export_history":
+                    export_session_history()
+                elif data.get("type") == "delete_memory":
+                    key = data.get("key")
+                    if key:
+                        delete_memory_fact(key)
+            except Exception as e:
+                if gui:
+                    gui.add_log(f"WS message error: {e}")
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        ui_clients.remove(websocket)
+
+class UltronDesktopGUI:
     def __init__(self):
         self.status = "Initializing"
         self.logs = []
-        self.wave_frame = 0
-        self.waves = [
-            "  ▂ ▃ ▄ ▅ ▆ ▇ ▆ ▅ ▄ ▃ ▂  ",
-            "  ▃ ▄ ▅ ▆ ▇ █ ▇ ▆ ▅ ▄ ▃  ",
-            "  ▄ ▅ ▆ ▇ █ ▇ ▆ ▅ ▄ ▃ ▂  ",
-            "  ▅ ▆ ▇ ▆ ▅ ▄ ▃ ▂     ▂  ",
-            "  ▆ ▅ ▄ ▃ ▂     ▂ ▃ ▄ ▅  "
-        ]
-        self.old_lines = []
 
     def set_status(self, status):
         self.status = status
-        self.redraw()
+        self.broadcast({"type": "status", "value": status})
 
     def add_log(self, log_msg):
         self.logs.append(log_msg)
-        self.redraw()
+        if len(self.logs) > 100:
+            self.logs = self.logs[-100:]
+        self.broadcast({"type": "log", "value": log_msg})
 
     def tick_wave(self):
-        if "Speaking" in self.status or "Thinking" in self.status or "Executing" in self.status or camera_stream_active:
-            self.wave_frame = (self.wave_frame + 1) % len(self.waves)
-            self.redraw()
+        pass
 
-    def redraw(self):
-        try:
-            columns, rows = os.get_terminal_size()
-        except:
-            columns, rows = 80, 24
-            
-        columns = max(columns, 60)
-        rows = max(rows, 15)
-        
-        CYAN = "\033[36m"
-        GREEN = "\033[32m"
-        YELLOW = "\033[33m"
-        BLUE = "\033[34m"
-        MAGENTA = "\033[35m"
-        RESET = "\033[0m"
-        BOLD = "\033[1m"
-        
-        new_lines = []
-        
-        def get_border_row(text, align="left", color=""):
-            content_width = columns - 6
-            if align == "center":
-                vis_w = get_visual_width(text)
-                padding = content_width - vis_w
-                left_pad = max(0, padding // 2)
-                right_pad = max(0, padding - left_pad)
-                line = " " * left_pad + text + " " * right_pad
-            else:
-                line = visual_ljust(text, content_width)
-            return f"{CYAN}│{RESET}  {color}{line}{RESET}  {CYAN}│{RESET}"
-
-        # 1. Top border
-        new_lines.append(f"{CYAN}┌" + "─" * (columns - 2) + f"┐{RESET}")
-        
-        # 2. Header
-        new_lines.append(get_border_row("🤖 PROJECT ULTRON SYSTEM 🤖", align="center", color=BOLD+CYAN))
-        new_lines.append(f"{CYAN}├" + "─" * (columns - 2) + f"┤{RESET}")
-        
-        # 3. Status & Senses
-        status_color = GREEN if "Listening" in self.status else (YELLOW if "Speaking" in self.status or "Thinking" in self.status or "Executing" in self.status else CYAN)
-        new_lines.append(get_border_row(f"SYSTEM STATUS: [ {self.status} ]", color=BOLD+status_color))
-        
-        webcam_status = "STREAMING" if camera_stream_active else "READY"
-        screen_status = "STREAMING" if screen_stream_active else "READY"
-        senses_line = f"SENSES:        🎤 [ Mic: ACTIVE ]  🖥️ [ Screen: {screen_status} ]  📷 [ Webcam: {webcam_status} ]"
-        new_lines.append(get_border_row(senses_line, color=BLUE))
-        new_lines.append(f"{CYAN}├" + "─" * (columns - 2) + f"┤{RESET}")
-        
-        # 4. Talking Visualizer
-        new_lines.append(get_border_row("TALKING VISUALIZER / EQUALIZER", align="center", color=BOLD+MAGENTA))
-        if "Speaking" in self.status or "Thinking" in self.status or "Executing" in self.status:
-            wave = self.waves[self.wave_frame]
-            new_lines.append(get_border_row(wave, align="center", color=MAGENTA))
-        else:
-            idle_line = "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-            new_lines.append(get_border_row(idle_line, align="center", color=BLUE))
-            
-        new_lines.append(f"{CYAN}├" + "─" * (columns - 2) + f"┤{RESET}")
-        
-        # 5. System logs
-        new_lines.append(get_border_row("SYSTEM LOGS", color=BOLD+YELLOW))
-        
-        log_panel_height = max(4, rows - 11)
-        display_logs = self.logs[-log_panel_height:] if self.logs else []
-        for log in display_logs:
-            new_lines.append(get_border_row(f"> {log}", color=RESET))
-        for _ in range(log_panel_height - len(display_logs)):
-            new_lines.append(get_border_row(""))
-            
-        # 6. Bottom Border
-        new_lines.append(f"{CYAN}└" + "─" * (columns - 2) + f"┘{RESET}")
-        
-        # Incremental writing to prevent screen flickering
-        if len(new_lines) != len(self.old_lines):
-            sys.stdout.write("\033[H\033[J")
-            for line in new_lines:
-                sys.stdout.write(line + "\n")
-            self.old_lines = list(new_lines)
-        else:
-            for i in range(len(new_lines)):
-                if new_lines[i] != self.old_lines[i]:
-                    sys.stdout.write(f"\033[{i+1};1H{new_lines[i]}\033[K")
-                    self.old_lines[i] = new_lines[i]
-        # Render the input prompt statically on the bottom line
-        prompt_line = f" {BOLD}{CYAN}Type message or speak (Ctrl+C to exit):{RESET} {input_buffer}"
-        sys.stdout.write(f"\033[{rows};1H{prompt_line}\033[K")
-        sys.stdout.flush()
+    def broadcast(self, data):
+        global event_loop
+        if event_loop is None or not event_loop.is_running():
+            return
+        async def do_broadcast():
+            if ui_clients:
+                msg = json.dumps(data)
+                await asyncio.gather(*[client.send(msg) for client in ui_clients], return_exceptions=True)
+        asyncio.run_coroutine_threadsafe(do_broadcast(), event_loop)
 
 # Global states
 play_queue = asyncio.Queue()
 interrupted_event = asyncio.Event()
 shutdown_event = asyncio.Event()
+model_switch_event = asyncio.Event()
 gui = None
-camera_stream_active = False
+camera_stream_active = True
 screen_stream_active = False
 active_webcam = None
 latest_webcam_frame_bytes = None
@@ -204,6 +312,7 @@ input_buffer = ""
 mic_audio_buffer = bytearray()
 MAX_BUFFER_SIZE = 96000  # 3 seconds of 16kHz 16-bit PCM
 model_is_speaking = False
+current_speaker_rms = 0.0
 
 PROFILES_FILE = "ultron_profiles.json"
 YUNET_MODEL_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
@@ -368,6 +477,8 @@ def extract_audio_signature(audio_data: bytes) -> list:
 
 def extract_multiple_voice_signatures(audio_data: bytes) -> list:
     """Divides audio into overlapping 1.5s windows to extract multiple speaker voice prints."""
+    if len(audio_data) < 16000:
+        return []
     window_size = 48000  # 1.5 seconds in bytes (16kHz 16-bit PCM)
     hop_size = 24000     # 0.75 seconds overlap
     
@@ -507,6 +618,50 @@ def save_memory(memory: dict):
         if gui:
             gui.add_log(f"Memory write error: {e}")
 
+def write_source_file(path: str, content: str) -> str:
+    """Create or overwrite a source file in the project workspace."""
+    try:
+        if path.endswith(".ipynb"):
+            return "Error: Editing .ipynb files is not supported."
+        parent_dir = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Successfully wrote {len(content)} characters to '{path}'."
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+def read_source_file(path: str) -> str:
+    """Read a source file from the project workspace."""
+    try:
+        if not os.path.exists(path):
+            return f"Error: File '{path}' does not exist."
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+async def execute_agent_command(command: str) -> str:
+    """Asynchronously execute a terminal command in the project environment and return stdout/stderr."""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        output = stdout.decode("utf-8", errors="ignore")
+        error = stderr.decode("utf-8", errors="ignore")
+        
+        result = f"Command exited with code {proc.returncode}.\n"
+        if output:
+            result += f"--- STDOUT ---\n{output}\n"
+        if error:
+            result += f"--- STDERR ---\n{error}\n"
+        return result
+    except Exception as e:
+        return f"Error executing command: {e}"
+
 def log_interaction(event_type: str, details: dict):
     try:
         log_entry = {
@@ -521,7 +676,7 @@ def log_interaction(event_type: str, details: dict):
             gui.add_log(f"Failed to log interaction: {e}")
 
 async def play_audio_worker(output_stream):
-    global model_is_speaking
+    global model_is_speaking, current_speaker_rms
     loop = asyncio.get_running_loop()
     while True:
         try:
@@ -531,10 +686,14 @@ async def play_audio_worker(output_stream):
                 continue
             
             model_is_speaking = True
+            chunk_data = np.frombuffer(chunk, dtype=np.int16)
+            current_speaker_rms = float(np.sqrt(np.mean(chunk_data.astype(np.float32)**2))) if len(chunk_data) > 0 else 0.0
+            
             await loop.run_in_executor(None, output_stream.write, chunk)
             play_queue.task_done()
             if play_queue.empty():
                 model_is_speaking = False
+                current_speaker_rms = 0.0
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -543,7 +702,7 @@ async def play_audio_worker(output_stream):
             await asyncio.sleep(0.1)
 
 async def send_audio_task(session, input_stream):
-    global mic_audio_buffer, model_is_speaking
+    global mic_audio_buffer, model_is_speaking, mic_muted
     loop = asyncio.get_running_loop()
     while True:
         try:
@@ -552,17 +711,29 @@ async def send_audio_task(session, input_stream):
                 lambda: input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
             )
             if data:
+                if mic_muted:
+                    data = b'\x00' * len(data)
+
                 mic_audio_buffer.extend(data)
                 if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
                     mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
                 
-                if not model_is_speaking:
-                    await session.send_realtime_input(
-                        audio=types.Blob(
-                            data=data,
-                            mime_type="audio/pcm;rate=16000"
-                        )
+                # Check for speaker feedback loop protection
+                if model_is_speaking:
+                    global current_speaker_rms
+                    if current_speaker_rms > 100:
+                        audio_data = np.frombuffer(data, dtype=np.int16)
+                        rms = float(np.sqrt(np.mean(audio_data.astype(np.float32)**2))) if len(audio_data) > 0 else 0.0
+                        if rms < 1500:
+                            # Mute mic stream with silent bytes to prevent VAD self-interruption
+                            data = b'\x00' * len(data)
+                
+                await session.send_realtime_input(
+                    audio=types.Blob(
+                        data=data,
+                        mime_type="audio/pcm;rate=16000"
                     )
+                )
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -570,59 +741,57 @@ async def send_audio_task(session, input_stream):
                 gui.add_log(f"Error reading mic: {e}")
             await asyncio.sleep(0.1)
 
-async def terminal_input_task(session):
-    """Asynchronously reads text input from the terminal with manual echo control to prevent character scattering."""
-    global input_buffer
-    loop = asyncio.get_running_loop()
-    
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    
+async def web_input_task(session):
+    """Asynchronously reads text input from the WebSocket connection and forwards to the Gemini Live session."""
+    global mic_audio_buffer, model_is_speaking
     try:
-        tty.setcbreak(fd)
         while not shutdown_event.is_set():
-            char = await loop.run_in_executor(None, sys.stdin.read, 1)
-            if not char:
-                break
+            user_input = await ws_input_queue.get()
+            ws_input_queue.task_done()
+            
+            if user_input:
+                user_input = user_input.strip()
+                if user_input.lower() in ('exit', 'quit', 'bye'):
+                    shutdown_event.set()
+                    break
                 
-            if char in ('\r', '\n'):
-                user_input = input_buffer.strip()
-                input_buffer = ""
-                if user_input:
-                    if user_input.lower() in ('exit', 'quit', 'bye'):
-                        shutdown_event.set()
-                        break
-                    
+                # Clear mic buffer on typed input
+                mic_audio_buffer.clear()
+                
+                # Text barge-in
+                if model_is_speaking:
                     if gui:
-                        gui.add_log(f"Typed: {user_input[:40]}...")
-                        gui.redraw()
-                    
-                    await session.send_client_content(
-                        turns=[{"role": "user", "parts": [{"text": user_input}]}],
-                        turn_complete=True
-                    )
-            elif char in ('\x7f', '\x08'):
-                if len(input_buffer) > 0:
-                    input_buffer = input_buffer[:-1]
-                    if gui:
-                        gui.redraw()
-            elif ord(char) >= 32 or char == '\t':
-                input_buffer += char
+                        gui.set_status("Listening (Interrupted)")
+                    interrupted_event.set()
+                    model_is_speaking = False
+                    while not play_queue.empty():
+                        try:
+                            play_queue.get_nowait()
+                            play_queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+                    await asyncio.sleep(0.05)
+                    interrupted_event.clear()
+                
                 if gui:
-                    gui.redraw()
+                    gui.add_log(f"Typed: {user_input[:40]}...")
+                
+                await session.send_client_content(
+                    turns=[{"role": "user", "parts": [{"text": user_input}]}],
+                    turn_complete=True
+                )
     except asyncio.CancelledError:
         pass
     except Exception as e:
         if gui:
             gui.add_log(f"Input task error: {e}")
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 async def stream_senses_task(session):
     """Continuously captures and streams the user's screen and webcam frames to the Live session in the background when enabled by the AI."""
     global active_webcam, latest_webcam_frame_bytes
     webcam = sentry_vision.PersistentWebcam()
     active_webcam = webcam
+    last_api_frame_time = 0.0
     try:
         while not shutdown_event.is_set():
             try:
@@ -639,13 +808,29 @@ async def stream_senses_task(session):
                     webcam_bytes = webcam.read_frame()
                     if webcam_bytes:
                         latest_webcam_frame_bytes = webcam_bytes
-                        await session.send_realtime_input(
-                            video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
-                        )
-                    await asyncio.sleep(0.8)
+                        # Broadcast to GUI at high frequency (~14 FPS) for smooth UI render
+                        import base64
+                        encoded_frame = base64.b64encode(webcam_bytes).decode('utf-8')
+                        if gui:
+                            gui.broadcast({
+                                "type": "webcam_frame",
+                                "image": f"data:image/jpeg;base64,{encoded_frame}"
+                            })
+                        
+                        # Throttle Gemini API video inputs to ~1.25 FPS
+                        loop_time = asyncio.get_running_loop().time()
+                        if loop_time - last_api_frame_time >= 0.8:
+                            await session.send_realtime_input(
+                                video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
+                            )
+                            last_api_frame_time = loop_time
+                    await asyncio.sleep(0.07)
                 else:
                     webcam.stop()
-                    latest_webcam_frame_bytes = None
+                    if latest_webcam_frame_bytes is not None:
+                        latest_webcam_frame_bytes = None
+                        if gui:
+                            gui.broadcast({"type": "webcam_off"})
 
                 if not screen_stream_active and not camera_stream_active:
                     await asyncio.sleep(1.0)
@@ -771,17 +956,41 @@ async def receive_audio_task(session):
                                 concept_name = fc.args.get("concept_name")
                                 html_content = fc.args.get("html_content")
                                 try:
-                                    filename = "ultron_visualization.html"
-                                    with open(filename, "w", encoding="utf-8") as f:
-                                        f.write(html_content)
-                                    import subprocess
-                                    subprocess.run(["open", filename])
-                                    result = f"Successfully generated HTML visualization for '{concept_name}' and opened in default browser."
+                                    if gui:
+                                        gui.broadcast({
+                                            "type": "visualization",
+                                            "title": concept_name,
+                                            "html": html_content
+                                        })
+                                        result = f"Successfully rendered visualization for '{concept_name}' in the Ultron GUI."
+                                    else:
+                                        result = "Error: GUI not initialized."
                                 except Exception as e:
-                                    result = f"Error generating HTML visualization: {str(e)}"
+                                    result = f"Error rendering HTML visualization: {str(e)}"
+                            elif fc.name == "write_source_file":
+                                path = fc.args.get("path")
+                                content = fc.args.get("content")
+                                result = write_source_file(path, content)
+                            elif fc.name == "read_source_file":
+                                path = fc.args.get("path")
+                                result = read_source_file(path)
+                            elif fc.name == "execute_agent_command":
+                                command = fc.args.get("command")
+                                result = await execute_agent_command(command)
                             elif fc.name == "shutdown_ultron":
                                 shutdown_event.set()
                                 result = "Shutting down the Project Ultron system. Goodbye!"
+                            elif fc.name == "switch_model":
+                                target_model = fc.args.get("model_id")
+                                result = switch_model_session(target_model)
+                            elif fc.name == "switch_voice":
+                                target_voice = fc.args.get("voice_name")
+                                result = switch_voice_session(target_voice)
+                            elif fc.name == "export_session_history":
+                                result = export_session_history()
+                            elif fc.name == "delete_memory_fact":
+                                key = fc.args.get("key")
+                                result = delete_memory_fact(key)
                             else:
                                 result = f"Unknown function: {fc.name}"
                                 
@@ -807,51 +1016,56 @@ async def receive_audio_task(session):
         if gui:
             gui.add_log(f"Receive stream error: {e}")
     finally:
-        shutdown_event.set()
+        if not model_switch_event.is_set():
+            shutdown_event.set()
 
-async def visualizer_tick_task():
-    while True:
+async def system_metrics_task():
+    while not shutdown_event.is_set():
         try:
-            if gui:
-                gui.tick_wave()
-            await asyncio.sleep(0.08)
-        except asyncio.CancelledError:
-            break
+            if psutil and gui:
+                cpu = round(psutil.cpu_percent(interval=None), 1)
+                ram = round(psutil.virtual_memory().percent, 1)
+                gui.broadcast({"type": "metrics", "cpu": cpu, "ram": ram})
+        except Exception:
+            pass
+        await asyncio.sleep(2)
 
 async def run_session_tasks(session, input_stream, output_stream):
-    shutdown_event.clear()
+    global model_switch_event
+    model_switch_event.clear()
     
     playback_task = asyncio.create_task(play_audio_worker(output_stream))
     audio_in_task = asyncio.create_task(send_audio_task(session, input_stream))
     audio_out_task = asyncio.create_task(receive_audio_task(session))
-    terminal_task = asyncio.create_task(terminal_input_task(session))
+    web_input_task_handle = asyncio.create_task(web_input_task(session))
     senses_task = asyncio.create_task(stream_senses_task(session))
-    visualizer_task = asyncio.create_task(visualizer_tick_task())
+    metrics_task = asyncio.create_task(system_metrics_task())
     
-    await shutdown_event.wait()
-    
-    # Stop streams to unblock any pending read/write calls in executors
-    try:
-        input_stream.stop_stream()
-    except:
-        pass
-    try:
-        output_stream.stop_stream()
-    except:
-        pass
+    done, pending = await asyncio.wait(
+        [
+            asyncio.create_task(shutdown_event.wait()),
+            asyncio.create_task(model_switch_event.wait())
+        ],
+        return_when=asyncio.FIRST_COMPLETED
+    )
+    for t in done:
+        t.result()
+    for p in pending:
+        p.cancel()
         
+    # Stop audio streams temporarily if switching models or shutting down
     audio_in_task.cancel()
     audio_out_task.cancel()
     playback_task.cancel()
-    terminal_task.cancel()
+    web_input_task_handle.cancel()
     senses_task.cancel()
-    visualizer_task.cancel()
+    metrics_task.cancel()
     
-    await asyncio.gather(audio_in_task, audio_out_task, playback_task, terminal_task, senses_task, visualizer_task, return_exceptions=True)
+    await asyncio.gather(audio_in_task, audio_out_task, playback_task, web_input_task_handle, senses_task, metrics_task, return_exceptions=True)
 
 async def run_ultron():
     global gui
-    gui = UltronTerminalGUI()
+    gui = UltronDesktopGUI()
     
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -863,23 +1077,25 @@ async def run_ultron():
     client = genai.Client(api_key=api_key)
 
     gui.set_status("Initializing Audio")
-    audio_system = pyaudio.PyAudio()
-    
+    with suppress_c_stdout_stderr():
+        audio_system = pyaudio.PyAudio()
+        
     try:
-        input_stream = audio_system.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=INPUT_RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE
-        )
-        output_stream = audio_system.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=OUTPUT_RATE,
-            output=True,
-            frames_per_buffer=CHUNK_SIZE
-        )
+        with suppress_c_stdout_stderr():
+            input_stream = audio_system.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=INPUT_RATE,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE
+            )
+            output_stream = audio_system.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=OUTPUT_RATE,
+                output=True,
+                frames_per_buffer=CHUNK_SIZE
+            )
     except Exception as e:
         gui.set_status("Audio Error")
         gui.add_log(f"Failed to open audio: {e}")
@@ -925,8 +1141,15 @@ async def run_ultron():
         "use the register_person tool. To identify who is currently in front of the camera or speaking, use the "
         "identify_current_user tool. You must identify them and greet them by name. If they ask 'who am I?', call "
         "identify_current_user to recognize them (even if the camera is off, it will match their voice print). "
+        "You also act as an autonomous software engineering and coding agent. You can inspect source code using read_source_file, "
+        "write code files using write_source_file, and run test/build commands with execute_agent_command. If you encounter a build "
+        "or runtime error, implement a Visual-to-Code loop: use look_at_screen to capture the error or compiler output, read the affected "
+        "files using read_source_file, locate the bug, rewrite the files using write_source_file to fix it, and verify using "
+        "execute_agent_command. Proceed through these steps autonomously to solve engineering tasks. "
         "You have access to tools that execute shell commands and AppleScript on the host Mac, "
-        "as well as a tool to visualize concepts dynamically by generating an HTML page. "
+        "as well as a tool to visualize concepts, data, layouts, or graphics dynamically by generating interactive HTML pages (visualize_concept) "
+        "which are rendered directly inside the Ultron desktop application GUI for the user. Whenever the user asks you to explain, "
+        "draw, diagram, plot, or visualize anything, you MUST generate the visualization HTML and call the visualize_concept tool. "
         "Keep your spoken responses short, friendly, and concise. "
         "If the user says goodbye, quit, or exit (in English or Malayalam), invoke the shutdown_ultron tool. "
         "Confirm with the user before executing destructive or high-risk shell commands."
@@ -1084,20 +1307,66 @@ async def run_ultron():
                     },
                     {
                         "name": "visualize_concept",
-                        "description": "Visualize a concept by generating an interactive, beautiful HTML/CSS/JS page containing diagrams and explanatory graphics, and opening it in the user's default browser.",
+                        "description": "Visualize any concept, diagram, data, layout, or graphic dynamically by generating interactive HTML/CSS/JS code to be rendered directly inside the Ultron desktop application GUI.",
                         "parameters": {
                             "type": "OBJECT",
                             "properties": {
                                 "concept_name": {
                                     "type": "STRING",
-                                    "description": "The title or name of the concept (e.g. 'How Neural Networks Work')."
+                                    "description": "The title or name of the visualization module (e.g. 'How Neural Networks Work')."
                                 },
                                 "html_content": {
                                     "type": "STRING",
-                                    "description": "The complete, standalone HTML source code with inline CSS/JS containing visual diagrams, flowcharts, SVGs, or interactive elements."
+                                    "description": "The complete, standalone HTML source code with inline CSS/JS containing visual diagrams, flowcharts, SVGs, charts, or interactive elements."
                                 }
                             },
                             "required": ["concept_name", "html_content"]
+                        }
+                    },
+                    {
+                        "name": "write_source_file",
+                        "description": "Create or overwrite a source code file in the local project workspace. Path must be relative to the workspace directory.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "path": {
+                                    "type": "STRING",
+                                    "description": "The relative path to the file to write (e.g. 'project_ultron/test.py')."
+                                },
+                                "content": {
+                                    "type": "STRING",
+                                    "description": "The full source code content to write to the file."
+                                }
+                            },
+                            "required": ["path", "content"]
+                        }
+                    },
+                    {
+                        "name": "read_source_file",
+                        "description": "Read the contents of a target source code file in the project workspace for code review and editing.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "path": {
+                                    "type": "STRING",
+                                    "description": "The relative path to the source file to read."
+                                }
+                            },
+                            "required": ["path"]
+                        }
+                    },
+                    {
+                        "name": "execute_agent_command",
+                        "description": "Asynchronously run a build, test, lint, or deployment command in the project environment, returning the standard output and standard error.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "command": {
+                                    "type": "STRING",
+                                    "description": "The shell command to run (e.g. 'pytest', 'ruff check', 'python -m py_compile project_ultron/ultron_hub.py')."
+                                }
+                            },
+                            "required": ["command"]
                         }
                     },
                     {
@@ -1107,70 +1376,240 @@ async def run_ultron():
                             "type": "OBJECT",
                             "properties": {}
                         }
+                    },
+                    {
+                        "name": "switch_model",
+                        "description": "Switch the active Gemini model for Project Ultron to a different model (e.g. 'gemini-3.1-flash-live-preview', 'gemini-2.5-flash-live-preview', 'gemini-2.0-flash-exp').",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "model_id": {
+                                    "type": "STRING",
+                                    "description": "The exact model ID string to switch to."
+                                }
+                            },
+                            "required": ["model_id"]
+                        }
+                    },
+                    {
+                        "name": "switch_voice",
+                        "description": "Switch the prebuilt voice for Project Ultron (e.g. 'Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede').",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "voice_name": {
+                                    "type": "STRING",
+                                    "description": "The prebuilt voice name."
+                                }
+                            },
+                            "required": ["voice_name"]
+                        }
+                    },
+                    {
+                        "name": "export_session_history",
+                        "description": "Export the current session interaction history into a formatted Markdown report ultron_history_export.md.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "delete_memory_fact",
+                        "description": "Delete a remembered fact from persistent memory by key.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "key": {
+                                    "type": "STRING",
+                                    "description": "The key of the memory fact to delete."
+                                }
+                            },
+                            "required": ["key"]
+                        }
                     }
                 ]
             }
         ]
     }
     
-    if previous_handle:
-        gui.add_log("Resuming previous session handle...")
-        config_dict["session_resumption"] = {
-            "handle": previous_handle,
-            "transparent": True
-        }
-
-    live_config = types.LiveConnectConfig(**config_dict)
-
-    gui.set_status("Connecting to API")
-    log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": previous_handle is not None})
+    config_dict["speech_config"] = types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=CURRENT_VOICE)
+        )
+    )
     
-    try:
-        async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
-            gui.set_status("Listening")
-            log_interaction("connection_success", {})
-            
-            await run_session_tasks(session, input_stream, output_stream)
-                
-    except Exception as e:
-        log_interaction("connection_error", {"error": str(e)})
-        if previous_handle:
-            gui.add_log("Resumption failed. Starting fresh...")
+    while not shutdown_event.is_set():
+        if model_switch_event.is_set():
+            previous_handle = None
             if os.path.exists(SESSION_HANDLE_FILE):
                 try:
                     os.remove(SESSION_HANDLE_FILE)
                 except:
                     pass
-            config_dict.pop("session_resumption", None)
-            fresh_config = types.LiveConnectConfig(**config_dict)
-            try:
-                async with client.aio.live.connect(model=MODEL_ID, config=fresh_config) as session:
-                    gui.set_status("Listening")
-                    log_interaction("connection_success", {"fresh": True})
-                    await run_session_tasks(session, input_stream, output_stream)
-            except Exception as fresh_err:
-                gui.set_status("Connection Failed")
-                gui.add_log(f"Connection failed: {fresh_err}")
+            model_switch_event.clear()
+
+        if previous_handle:
+            gui.add_log("Resuming previous session handle...")
+            config_dict["session_resumption"] = {
+                "handle": previous_handle,
+                "transparent": True
+            }
         else:
-            gui.set_status("Connection Failed")
-            gui.add_log(f"API Error: {e}")
-    finally:
-        gui.set_status("Shutting Down")
+            config_dict.pop("session_resumption", None)
+
+        live_config = types.LiveConnectConfig(**config_dict)
+
+        gui.set_status("Connecting to API")
+        log_interaction("connection_attempt", {"model": CURRENT_MODEL_ID, "resuming": previous_handle is not None})
+        
         try:
-            input_stream.close()
-        except:
-            pass
+            async with client.aio.live.connect(model=CURRENT_MODEL_ID, config=live_config) as session:
+                gui.set_status("Listening")
+                gui.broadcast({"type": "model_update", "value": CURRENT_MODEL_ID, "models": SUPPORTED_MODELS})
+                log_interaction("connection_success", {"model": CURRENT_MODEL_ID})
+                
+                await run_session_tasks(session, input_stream, output_stream)
+                    
+        except Exception as e:
+            log_interaction("connection_error", {"error": str(e)})
+            if previous_handle:
+                gui.add_log("Resumption failed. Starting fresh...")
+                if os.path.exists(SESSION_HANDLE_FILE):
+                    try:
+                        os.remove(SESSION_HANDLE_FILE)
+                    except:
+                        pass
+                config_dict.pop("session_resumption", None)
+                fresh_config = types.LiveConnectConfig(**config_dict)
+                try:
+                    async with client.aio.live.connect(model=CURRENT_MODEL_ID, config=fresh_config) as session:
+                        gui.set_status("Listening")
+                        gui.broadcast({"type": "model_update", "value": CURRENT_MODEL_ID, "models": SUPPORTED_MODELS})
+                        log_interaction("connection_success", {"fresh": True, "model": CURRENT_MODEL_ID})
+                        await run_session_tasks(session, input_stream, output_stream)
+                except Exception as fresh_err:
+                    gui.set_status("Connection Failed")
+                    gui.add_log(f"Connection failed: {fresh_err}")
+                    await asyncio.sleep(1)
+            else:
+                gui.set_status("Connection Failed")
+                gui.add_log(f"API Error: {e}")
+                await asyncio.sleep(1)
+
+        if model_switch_event.is_set():
+            gui.add_log(f"Reconnecting with model: {CURRENT_MODEL_ID}")
+            continue
+        else:
+            break
+
+    gui.set_status("Shutting Down")
+    try:
+        input_stream.close()
+    except:
+        pass
+    try:
+        output_stream.close()
+    except:
+        pass
+    audio_system.terminate()
+    print("Project Ultron engine terminated. Goodbye.")
+
+# macOS Cocoa Application Delegate
+class AppDelegate(NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        # Center the window
+        rect = NSRect(NSPoint(150, 150), NSSize(800, 600))
+        mask = (NSTitledWindowMask | NSClosableWindowMask | 
+                NSMiniaturizableWindowMask | NSResizableWindowMask)
+        
+        self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, mask, NSBackingStoreBuffered, False
+        )
+        self.window.setTitle_("Project Ultron")
+        
+        # Add native blurred vibrancy background
+        vibrancy = NSVisualEffectView.alloc().initWithFrame_(rect)
+        vibrancy.setMaterial_(NSVisualEffectMaterialDark)
+        vibrancy.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        vibrancy.setState_(NSVisualEffectStateActive)
+        self.window.setContentView_(vibrancy)
+        
+        # Webview configuration (non-persistent data store)
+        config = WKWebViewConfiguration.alloc().init()
         try:
-            output_stream.close()
-        except:
+            config.setWebsiteDataStore_(WKWebsiteDataStore.nonPersistentDataStore())
+        except Exception:
             pass
-        audio_system.terminate()
-        sys.stdout.write("\033[H\033[J")
-        print("Project Ultron engine terminated. Goodbye.")
+            
+        # Create WebKit webview
+        self.webview = WKWebView.alloc().initWithFrame_configuration_(rect, config)
+        self.webview.setOpaque_(False)
+        self.webview.setBackgroundColor_(NSColor.clearColor())
+        try:
+            self.webview.setValue_forKey_(False, "drawsBackground")
+        except Exception:
+            pass
+        vibrancy.addSubview_(self.webview)
+        
+        # Setup layout constraints
+        self.webview.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        NSLayoutConstraint.activateConstraints_([
+            self.webview.topAnchor().constraintEqualToAnchor_(vibrancy.topAnchor()),
+            self.webview.bottomAnchor().constraintEqualToAnchor_(vibrancy.bottomAnchor()),
+            self.webview.leadingAnchor().constraintEqualToAnchor_(vibrancy.leadingAnchor()),
+            self.webview.trailingAnchor().constraintEqualToAnchor_(vibrancy.trailingAnchor()),
+        ])
+        
+        # Load the HTML file relative to the script directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        ui_path = os.path.join(script_dir, "desktop_ui.html")
+        url = NSURL.fileURLWithPath_(ui_path)
+        
+        # Enable WebKit Inspector / developer tools
+        try:
+            self.webview.configuration().preferences().setValue_forKey_(True, "developerExtrasEnabled")
+        except Exception:
+            pass
+            
+        self.webview.loadFileURL_allowingReadAccessToURL_(url, url.URLByDeletingLastPathComponent())
+        
+        self.window.makeKeyAndOrderFront_(None)
+        
+    def applicationWillTerminate_(self, notification):
+        shutdown_event.set()
+
+event_loop = None
+
+async def async_main():
+    # Start WebSocket Server inside the running loop context
+    async with websockets.serve(ws_handler, "localhost", 8765, reuse_port=True):
+        await run_ultron()
+
+def run_async_loop():
+    global event_loop
+    event_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(event_loop)
+    
+    try:
+        event_loop.run_until_complete(async_main())
+    except Exception as e:
+        print(f"Async engine crash: {e}")
 
 if __name__ == "__main__":
+    # Start the asyncio Live client in a background thread
+    t = threading.Thread(target=run_async_loop, daemon=True)
+    t.start()
+    
+    # Run the native Cocoa AppKit loop on the main thread
+    app = NSApplication.sharedApplication()
+    delegate = AppDelegate.alloc().init()
+    app.setDelegate_(delegate)
+    
+    from PyObjCTools import AppHelper
     try:
-        asyncio.run(run_ultron())
+        AppHelper.runEventLoop()
     except KeyboardInterrupt:
-        sys.stdout.write("\033[H\033[J")
-        print("\nProject Ultron terminated by user.")
+        pass
+    finally:
+        shutdown_event.set()
+        print("Project Ultron application terminated.")
