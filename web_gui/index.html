@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ultron — Personal Assistant</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app">
+
+    <!-- Header -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" id="brand-mark"></div>
+        <span class="brand-name">Ultron</span>
+      </div>
+
+      <div class="status-chip" id="system-status">
+        <span class="status-dot"></span>
+        <span id="status-text">Connecting…</span>
+      </div>
+
+      <div class="sense-chips">
+        <div class="chip active" id="sense-mic" title="Microphone">
+          <span class="chip-dot"></span><span class="sense-text">Mic</span>
+        </div>
+        <div class="chip" id="sense-cam" title="Camera">
+          <span class="chip-dot"></span><span class="sense-text">Camera</span>
+        </div>
+        <div class="chip" id="sense-screen" title="Screen">
+          <span class="chip-dot"></span><span class="sense-text">Screen</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main -->
+    <main class="layout">
+
+      <!-- Sidebar -->
+      <aside class="sidebar">
+        <div class="card core-card">
+          <canvas id="visualizer-canvas" width="360" height="120"></canvas>
+          <div class="core-state" id="audio-state-tag">Idle</div>
+        </div>
+
+        <div class="card controls-card">
+          <button class="ctl active" id="btn-mic">
+            <span class="ctl-icon">🎙</span><span class="btn-lbl">Mic on</span>
+          </button>
+          <button class="ctl" id="btn-cam">
+            <span class="ctl-icon">📷</span><span class="btn-lbl">Camera</span>
+          </button>
+          <button class="ctl" id="btn-screen">
+            <span class="ctl-icon">🖥</span><span class="btn-lbl">Screen</span>
+          </button>
+          <button class="ctl stop" id="btn-interrupt">
+            <span class="ctl-icon">■</span><span class="btn-lbl">Stop</span>
+          </button>
+        </div>
+
+        <div class="card feed-card">
+          <div class="feed-label">Camera</div>
+          <div class="feed-body">
+            <img id="webcam-img" style="display:none;" />
+            <span class="feed-off" id="cam-placeholder">Off</span>
+          </div>
+        </div>
+
+        <div class="card feed-card">
+          <div class="feed-label">Screen</div>
+          <div class="feed-body">
+            <img id="screen-img" style="display:none;" />
+            <span class="feed-off" id="screen-placeholder">Off</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Content -->
+      <section class="content card">
+        <nav class="tabs">
+          <button class="tab active" id="tab-chat-btn" onclick="switchTab('chat')">Chat</button>
+          <button class="tab" id="tab-vis-btn" onclick="switchTab('vis')">
+            Visuals<span class="tab-badge" id="vis-badge"></span>
+          </button>
+          <button class="tab" id="tab-act-btn" onclick="switchTab('act')">
+            Activity<span class="tab-badge" id="act-badge"></span>
+          </button>
+        </nav>
+
+        <!-- Chat -->
+        <div class="tab-view active" id="tab-chat">
+          <div class="chat-scroll" id="chat-messages">
+            <div class="chat-welcome">
+              <p>Hi Vince — talk to me over the mic, or type below.</p>
+            </div>
+          </div>
+          <div class="chat-inputbar">
+            <input type="text" id="chat-input" placeholder="Message Ultron…" autocomplete="off" />
+            <button id="send-btn" title="Send">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Visuals -->
+        <div class="tab-view" id="tab-vis">
+          <div class="vis-toolbar">
+            <span class="vis-name" id="vis-concept-name">Nothing rendered yet</span>
+            <div class="vis-actions">
+              <button class="ghost-btn" onclick="reloadVisFrame()">Reload</button>
+              <button class="ghost-btn" onclick="toggleVisFullscreen()">Fullscreen</button>
+            </div>
+          </div>
+          <div class="vis-stage" id="vis-frame-container">
+            <iframe id="vis-iframe" sandbox="allow-scripts allow-same-origin"></iframe>
+            <div class="empty-state" id="vis-placeholder">
+              <p>Diagrams and interactive explanations Ultron generates appear here.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Activity -->
+        <div class="tab-view" id="tab-act">
+          <div class="activity-feed" id="activity-feed">
+            <div class="empty-state" id="activity-empty">
+              <p>Every action — commands, clicks, web fetches, recognitions — shows up here live.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

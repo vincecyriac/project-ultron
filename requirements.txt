@@ -5,4 +5,7 @@ pillow
 python-dotenv
 pyaudio
 pyobjc-core
-pyobjc
+pyobjc-framework-Quartz
+pywebview
+websockets
+aiohttp
