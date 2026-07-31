@@ -26,6 +26,7 @@ import sentry_exec
 import sentry_action
 import sentry_recognition
 import sentry_web
+import sentry_local
 
 # Load environment variables
 load_dotenv()
@@ -42,6 +43,16 @@ MEMORY_FILE = "ultron_memory.json"
 
 # Model selection: defaults to gemini-3.1-flash-live-preview, customizable via env
 MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
+
+# Local models served by LM Studio (OpenAI-compatible API)
+LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+LOCAL_MODELS = [m.strip() for m in os.getenv("LOCAL_MODELS", "").split(",") if m.strip()]
+
+def get_model_registry() -> list:
+    models = [{"id": MODEL_ID, "type": "gemini", "label": f"Gemini Live · {MODEL_ID}"}]
+    for m in LOCAL_MODELS:
+        models.append({"id": m, "type": "local", "label": f"Local · {m}"})
+    return models
 
 # Audio configuration
 FORMAT = pyaudio.paInt16
@@ -68,6 +79,12 @@ MAX_BUFFER_SIZE = 320000  # 10 seconds of 16kHz 16-bit PCM (voice enrollment win
 model_is_speaking = False
 connected_ws_clients = set()
 global_live_session = None
+active_model = {"type": "gemini", "id": MODEL_ID}
+local_client = None
+system_prompt_text = ""
+
+def gemini_mode() -> bool:
+    return active_model["type"] == "gemini"
 
 def broadcast_event(data: dict):
     if not connected_ws_clients:
@@ -92,6 +109,11 @@ async def ws_handler(websocket):
         "camera_active": camera_stream_active,
         "screen_active": screen_stream_active
     }))
+    await websocket.send(json.dumps({
+        "type": "model_list",
+        "models": get_model_registry(),
+        "active_id": active_model["id"]
+    }))
     try:
         async for message in websocket:
             try:
@@ -99,22 +121,42 @@ async def ws_handler(websocket):
                 msg_type = data.get("type")
                 if msg_type == "audio_in":
                     pcm_b64 = data.get("pcm_base64")
-                    if pcm_b64 and global_live_session:
+                    if pcm_b64:
                         pcm_bytes = base64.b64decode(pcm_b64)
                         mic_audio_buffer.extend(pcm_bytes)
                         if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
                             mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
-                        await global_live_session.send_realtime_input(
-                            audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
-                        )
+                        if gemini_mode() and global_live_session:
+                            await global_live_session.send_realtime_input(
+                                audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
+                            )
                 elif msg_type == "user_text":
                     text = data.get("text")
-                    if text and global_live_session:
+                    if text and not gemini_mode():
+                        log_info(f"GUI Chat (local): {text[:40]}...")
+                        asyncio.create_task(handle_local_chat(text))
+                    elif text and global_live_session:
                         log_info(f"GUI Chat: {text[:40]}...")
                         await global_live_session.send_client_content(
                             turns=[{"role": "user", "parts": [{"text": text}]}],
                             turn_complete=True
                         )
+                elif msg_type == "select_model":
+                    mid = data.get("id")
+                    entry = next((m for m in get_model_registry() if m["id"] == mid), None)
+                    if entry:
+                        active_model["type"] = entry["type"]
+                        active_model["id"] = entry["id"]
+                        broadcast_event({
+                            "type": "model_changed",
+                            "id": entry["id"],
+                            "model_type": entry["type"],
+                            "label": entry["label"]
+                        })
+                        if entry["type"] == "local":
+                            log_info(f"Switched to local model: {entry['id']} (text chat; voice stays with Gemini Live).")
+                        else:
+                            log_info(f"Switched to Gemini Live: {entry['id']}.")
                 elif msg_type == "toggle_camera":
                     camera_stream_active = data.get("active", False)
                     broadcast_event({
@@ -237,7 +279,7 @@ async def send_audio_task(session, input_stream):
                     mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
                 
                 # Only send PyAudio mic data to Gemini if NO WebSocket GUI client is connected
-                if not model_is_speaking and not connected_ws_clients:
+                if not model_is_speaking and not connected_ws_clients and gemini_mode():
                     await session.send_realtime_input(
                         audio=types.Blob(
                             data=data,
@@ -264,9 +306,10 @@ async def stream_senses_task(session):
                     if screen_bytes:
                         b64 = base64.b64encode(screen_bytes).decode('utf-8')
                         broadcast_event({"type": "screen_frame", "image_base64": b64})
-                        await session.send_realtime_input(
-                            video=types.Blob(data=screen_bytes, mime_type="image/jpeg")
-                        )
+                        if gemini_mode():
+                            await session.send_realtime_input(
+                                video=types.Blob(data=screen_bytes, mime_type="image/jpeg")
+                            )
                     await asyncio.sleep(0.8)
                 
                 if camera_stream_active:
@@ -276,9 +319,10 @@ async def stream_senses_task(session):
                         latest_webcam_frame_bytes = webcam_bytes
                         b64 = base64.b64encode(webcam_bytes).decode('utf-8')
                         broadcast_event({"type": "camera_frame", "image_base64": b64})
-                        await session.send_realtime_input(
-                            video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
-                        )
+                        if gemini_mode():
+                            await session.send_realtime_input(
+                                video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
+                            )
                     await asyncio.sleep(0.8)
                 else:
                     webcam.stop()
@@ -296,349 +340,160 @@ async def stream_senses_task(session):
         active_webcam = None
         latest_webcam_frame_bytes = None
 
-async def receive_audio_task(session):
-    global camera_stream_active, screen_stream_active, model_is_speaking
+async def handle_local_chat(text: str):
+    """Routes a GUI text message through the active LM Studio model with tool support."""
+    global local_client
     try:
-        while not shutdown_event.is_set():
-            async for message in session.receive():
-                try:
-                    # 1. Interruption (Barge-In)
-                    if message.server_content and message.server_content.interrupted:
-                        set_system_status("Listening (Interrupted)")
-                        interrupted_event.set()
-                        model_is_speaking = False
-                        while not play_queue.empty():
-                            try:
-                                play_queue.get_nowait()
-                                play_queue.task_done()
-                            except asyncio.QueueEmpty:
-                                break
-                        await asyncio.sleep(0.05)
-                        interrupted_event.clear()
-                        broadcast_event({"type": "interrupted"})
-                        log_interaction("user_interruption", {})
-                        continue
+        set_system_status(f"Thinking ({active_model['id']})")
+        if local_client is None or local_client.model != active_model["id"]:
+            local_client = sentry_local.LocalModelClient(
+                LMSTUDIO_BASE_URL, active_model["id"], TOOL_FUNCTION_DECLARATIONS
+            )
 
-                    # 2. Audio Output
-                    if message.server_content and message.server_content.model_turn:
-                        for part in message.server_content.model_turn.parts:
-                            if part.inline_data:
-                                set_system_status("Speaking")
-                                audio_data = part.inline_data.data
-                                await play_queue.put(audio_data)
-                                pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
-                                broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
-                            if part.text:
-                                broadcast_event({"type": "chat_log", "sender": "Ultron", "text": part.text, "style": "ultron"})
+        def on_tool(name, args):
+            set_system_status(f"Executing {name}")
+            broadcast_event({
+                "type": "tool_activity", "phase": "start", "name": name,
+                "args_preview": json.dumps(args)[:220]
+            })
+            log_interaction("tool_call_received", {"name": name, "args": args, "backend": "local"})
 
-                    # Reset status to Listening when turn finishes
-                    if message.server_content and message.server_content.turn_complete:
-                        set_system_status("Listening")
+        def on_tool_done(name, result):
+            broadcast_event({
+                "type": "tool_activity", "phase": "done", "name": name,
+                "result_preview": str(result)[:300]
+            })
+            log_interaction("tool_call_executed", {"name": name, "output_preview": str(result)[:100], "backend": "local"})
 
-                    # 3. Handle Session Resumption (Silent log)
-                    if message.session_resumption_update:
-                        update = message.session_resumption_update
-                        if update.resumable and update.new_handle:
-                            with open(SESSION_HANDLE_FILE, "w") as f:
-                                json.dump({"handle": update.new_handle}, f)
-                            log_interaction("session_resumption_update", {"handle_preview": update.new_handle[:15]})
-
-                    # 4. Handle OS Execution Tool Calls
-                    if message.tool_call:
-                        function_responses = []
-                        for fc in message.tool_call.function_calls:
-                            set_system_status(f"Executing {fc.name}")
-                            log_info(f"Tool call: {fc.name}")
-                            broadcast_event({
-                                "type": "tool_activity",
-                                "phase": "start",
-                                "name": fc.name,
-                                "args_preview": json.dumps(dict(fc.args or {}))[:220]
-                            })
-                            log_interaction("tool_call_received", {"name": fc.name, "args": fc.args})
-                            
-                            result = ""
-                            if fc.name == "execute_shell_command":
-                                cmd = fc.args.get("command")
-                                result = sentry_exec.execute_shell(cmd)
-                            elif fc.name == "execute_applescript_task":
-                                script = fc.args.get("script")
-                                result = sentry_exec.execute_applescript(script)
-                            elif fc.name == "look_at_screen":
-                                display_sel = fc.args.get("display", "active")
-                                screen_bytes = await asyncio.get_running_loop().run_in_executor(
-                                    None, sentry_vision.capture_screen, display_sel
-                                )
-                                if screen_bytes:
-                                    await session.send_realtime_input(
-                                        video=types.Blob(data=screen_bytes, mime_type="image/jpeg")
-                                    )
-                                    result = (
-                                        f"Screen captured (mode: {display_sel}) and loaded into your visual sensor. "
-                                        f"{sentry_vision.describe_displays()} "
-                                        "Click coordinates (0-1000) now map onto exactly this captured area. "
-                                        "Tell the user what is on the screen."
-                                    )
-                                else:
-                                    result = "Error: Failed to capture screen. Verify Screen Recording permissions."
-                            elif fc.name == "look_at_webcam":
-                                webcam_bytes = sentry_vision.capture_webcam()
-                                if webcam_bytes:
-                                    await session.send_realtime_input(
-                                        video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
-                                    )
-                                    result = "Webcam frame captured successfully and loaded into your visual sensor. Tell the user what you see."
-                                else:
-                                    result = "Error: Failed to capture webcam. Verify camera access permissions."
-                            elif fc.name == "start_camera_stream":
-                                camera_stream_active = True
-                                broadcast_event({"type": "sense_update", "camera_active": True, "screen_active": screen_stream_active})
-                                reason = fc.args.get("reason", "")
-                                result = f"Webcam continuous streaming started. Reason: '{reason}'."
-                            elif fc.name == "stop_camera_stream":
-                                camera_stream_active = False
-                                broadcast_event({"type": "sense_update", "camera_active": False, "screen_active": screen_stream_active})
-                                result = "Webcam continuous streaming stopped."
-                            elif fc.name == "start_screen_stream":
-                                screen_stream_active = True
-                                broadcast_event({"type": "sense_update", "camera_active": camera_stream_active, "screen_active": True})
-                                reason = fc.args.get("reason", "")
-                                result = f"Screen continuous capture started. Reason: '{reason}'."
-                            elif fc.name == "stop_screen_stream":
-                                screen_stream_active = False
-                                broadcast_event({"type": "sense_update", "camera_active": camera_stream_active, "screen_active": False})
-                                result = "Screen continuous capture stopped."
-                            elif fc.name == "register_person":
-                                name = fc.args.get("name")
-                                result = register_person(name)
-                            elif fc.name == "identify_current_user":
-                                result = identify_current_user()
-                            elif fc.name == "save_memory_fact":
-                                key = fc.args.get("key")
-                                val = fc.args.get("value")
-                                memory = load_memory()
-                                memory[key] = val
-                                save_memory(memory)
-                                result = f"Fact saved: '{key}' is now remembered as '{val}'."
-                            elif fc.name == "retrieve_memory_facts":
-                                memory = load_memory()
-                                result = json.dumps(memory, ensure_ascii=False)
-                            elif fc.name == "visualize_concept":
-                                concept_name = fc.args.get("concept_name")
-                                html_content = fc.args.get("html_content")
-                                try:
-                                    filename = "ultron_visualization.html"
-                                    with open(filename, "w", encoding="utf-8") as f:
-                                        f.write(html_content)
-                                    broadcast_event({
-                                        "type": "visualization",
-                                        "concept_name": concept_name,
-                                        "html_content": html_content
-                                    })
-                                    result = f"Successfully generated HTML visualization for '{concept_name}' and rendered inside the Desktop App GUI."
-                                except Exception as e:
-                                    result = f"Error generating HTML visualization: {str(e)}"
-                            elif fc.name == "fetch_webpage":
-                                url = fc.args.get("url")
-                                result = await sentry_web.fetch_webpage(url)
-                            elif fc.name == "computer_click":
-                                result = await asyncio.get_running_loop().run_in_executor(
-                                    None, sentry_action.click,
-                                    int(fc.args.get("x", 500)), int(fc.args.get("y", 500)),
-                                    fc.args.get("button", "left"), int(fc.args.get("clicks", 1))
-                                )
-                            elif fc.name == "computer_type":
-                                result = await asyncio.get_running_loop().run_in_executor(
-                                    None, sentry_action.type_text,
-                                    fc.args.get("text", ""), bool(fc.args.get("press_enter", False))
-                                )
-                            elif fc.name == "computer_press_keys":
-                                result = await asyncio.get_running_loop().run_in_executor(
-                                    None, sentry_action.press_keys, list(fc.args.get("keys", []))
-                                )
-                            elif fc.name == "computer_scroll":
-                                x = fc.args.get("x")
-                                y = fc.args.get("y")
-                                result = await asyncio.get_running_loop().run_in_executor(
-                                    None, sentry_action.scroll,
-                                    int(fc.args.get("amount", -5)),
-                                    int(x) if x is not None else None,
-                                    int(y) if y is not None else None
-                                )
-                            elif fc.name == "computer_drag":
-                                result = await asyncio.get_running_loop().run_in_executor(
-                                    None, sentry_action.drag,
-                                    int(fc.args.get("x1", 0)), int(fc.args.get("y1", 0)),
-                                    int(fc.args.get("x2", 0)), int(fc.args.get("y2", 0))
-                                )
-                            elif fc.name == "read_ui_elements":
-                                result = await asyncio.get_running_loop().run_in_executor(
-                                    None, sentry_action.read_ui_elements
-                                )
-                            elif fc.name == "shutdown_ultron":
-                                shutdown_event.set()
-                                result = "Shutting down the Project Ultron system. Goodbye!"
-                            else:
-                                result = f"Unknown function: {fc.name}"
-                                
-                            log_info(f"Result: {str(result)[:50]}...")
-                            broadcast_event({
-                                "type": "tool_activity",
-                                "phase": "done",
-                                "name": fc.name,
-                                "result_preview": str(result)[:300]
-                            })
-                            log_interaction("tool_call_executed", {"name": fc.name, "output_preview": str(result)[:100]})
-                            
-                            function_responses.append(types.FunctionResponse(
-                                id=fc.id,
-                                name=fc.name,
-                                response={"output": result}
-                            ))
-                        
-                        await session.send_tool_response(function_responses=function_responses)
-
-                        
-                except Exception as e:
-                    log_info(f"Error in receive message: {e}")
-            
-            await asyncio.sleep(0.05)
-            
+        reply = await local_client.chat(text, system_prompt_text, execute_tool, on_tool, on_tool_done)
+        if reply:
+            broadcast_event({"type": "chat_log", "sender": "Ultron", "text": reply, "style": "ultron"})
     except Exception as e:
-        log_info(f"Receive stream error: {e}")
+        broadcast_event({
+            "type": "chat_log", "sender": "System",
+            "text": f"Local model error: {e}. Is LM Studio's server running (Developer tab -> Start Server) and the model '{active_model['id']}' loaded?",
+            "style": "system"
+        })
     finally:
-        shutdown_event.set()
+        set_system_status("Listening")
 
+async def execute_tool(name: str, args: dict) -> tuple:
+    """Shared tool dispatcher for both the Gemini Live session and local models.
+    Returns (result_text, image_bytes_or_None); image is a capture the caller
+    should feed into its model's visual context."""
+    global camera_stream_active, screen_stream_active
+    loop = asyncio.get_running_loop()
+    args = args or {}
+    result = ""
+    image = None
 
-async def run_session_tasks(session, input_stream, output_stream):
-    global global_live_session
-    global_live_session = session
-    shutdown_event.clear()
-    
-    ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
-    log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
-    
-    playback_task = asyncio.create_task(play_audio_worker(output_stream))
-    audio_in_task = asyncio.create_task(send_audio_task(session, input_stream))
-    audio_out_task = asyncio.create_task(receive_audio_task(session))
-    senses_task = asyncio.create_task(stream_senses_task(session))
-    
-    await shutdown_event.wait()
-    
-    ws_server.close()
-    await ws_server.wait_closed()
-    
-    # Stop streams to unblock any pending read/write calls in executors
-    try:
-        input_stream.stop_stream()
-    except:
-        pass
-    try:
-        output_stream.stop_stream()
-    except:
-        pass
-        
-    audio_in_task.cancel()
-    audio_out_task.cancel()
-    playback_task.cancel()
-    senses_task.cancel()
-    
-    await asyncio.gather(audio_in_task, audio_out_task, playback_task, senses_task, return_exceptions=True)
-
-async def run_ultron():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        set_system_status("ERROR")
-        log_info("GEMINI_API_KEY environment variable not set.")
-        sys.exit(1)
-
-    set_system_status("Initializing Client")
-    client = genai.Client(api_key=api_key)
-
-    set_system_status("Initializing Audio")
-    audio_system = pyaudio.PyAudio()
-    
-    try:
-        input_stream = audio_system.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=INPUT_RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE
-        )
-        output_stream = audio_system.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=OUTPUT_RATE,
-            output=True,
-            frames_per_buffer=CHUNK_SIZE
-        )
-    except Exception as e:
-        set_system_status("Audio Error")
-        log_info(f"Failed to open audio: {e}")
-        audio_system.terminate()
-        sys.exit(1)
-
-    previous_handle = None
-    if os.path.exists(SESSION_HANDLE_FILE):
+    if name == "execute_shell_command":
+        result = await loop.run_in_executor(None, sentry_exec.execute_shell, args.get("command", ""))
+    elif name == "execute_applescript_task":
+        result = await loop.run_in_executor(None, sentry_exec.execute_applescript, args.get("script", ""))
+    elif name == "look_at_screen":
+        display_sel = args.get("display", "active")
+        image = await loop.run_in_executor(None, sentry_vision.capture_screen, display_sel)
+        if image:
+            result = (
+                f"Screen captured (mode: {display_sel}) and loaded into your visual sensor. "
+                f"{sentry_vision.describe_displays()} "
+                "Click coordinates (0-1000) now map onto exactly this captured area. "
+                "Tell the user what is on the screen."
+            )
+        else:
+            result = "Error: Failed to capture screen. Verify Screen Recording permissions."
+    elif name == "look_at_webcam":
+        image = await loop.run_in_executor(None, sentry_vision.capture_webcam)
+        if image:
+            result = "Webcam frame captured successfully and loaded into your visual sensor. Tell the user what you see."
+        else:
+            result = "Error: Failed to capture webcam. Verify camera access permissions."
+    elif name == "start_camera_stream":
+        camera_stream_active = True
+        broadcast_event({"type": "sense_update", "camera_active": True, "screen_active": screen_stream_active})
+        result = f"Webcam continuous streaming started. Reason: '{args.get('reason', '')}'."
+    elif name == "stop_camera_stream":
+        camera_stream_active = False
+        broadcast_event({"type": "sense_update", "camera_active": False, "screen_active": screen_stream_active})
+        result = "Webcam continuous streaming stopped."
+    elif name == "start_screen_stream":
+        screen_stream_active = True
+        broadcast_event({"type": "sense_update", "camera_active": camera_stream_active, "screen_active": True})
+        result = f"Screen continuous capture started. Reason: '{args.get('reason', '')}'."
+    elif name == "stop_screen_stream":
+        screen_stream_active = False
+        broadcast_event({"type": "sense_update", "camera_active": camera_stream_active, "screen_active": False})
+        result = "Screen continuous capture stopped."
+    elif name == "register_person":
+        result = await loop.run_in_executor(None, register_person, args.get("name", "Unknown"))
+    elif name == "identify_current_user":
+        result = await loop.run_in_executor(None, identify_current_user)
+    elif name == "save_memory_fact":
+        key = args.get("key")
+        val = args.get("value")
+        memory = load_memory()
+        memory[key] = val
+        save_memory(memory)
+        result = f"Fact saved: '{key}' is now remembered as '{val}'."
+    elif name == "retrieve_memory_facts":
+        result = json.dumps(load_memory(), ensure_ascii=False)
+    elif name == "visualize_concept":
+        concept_name = args.get("concept_name")
+        html_content = args.get("html_content")
         try:
-            with open(SESSION_HANDLE_FILE, "r") as f:
-                state = json.load(f)
-                previous_handle = state.get("handle")
+            with open("ultron_visualization.html", "w", encoding="utf-8") as f:
+                f.write(html_content)
+            broadcast_event({
+                "type": "visualization",
+                "concept_name": concept_name,
+                "html_content": html_content
+            })
+            result = f"Successfully generated HTML visualization for '{concept_name}' and rendered inside the Desktop App GUI."
         except Exception as e:
-            log_info(f"Failed to load handle: {e}")
+            result = f"Error generating HTML visualization: {str(e)}"
+    elif name == "fetch_webpage":
+        result = await sentry_web.fetch_webpage(args.get("url"))
+    elif name == "computer_click":
+        result = await loop.run_in_executor(
+            None, sentry_action.click,
+            int(args.get("x", 500)), int(args.get("y", 500)),
+            args.get("button", "left"), int(args.get("clicks", 1))
+        )
+    elif name == "computer_type":
+        result = await loop.run_in_executor(
+            None, sentry_action.type_text,
+            args.get("text", ""), bool(args.get("press_enter", False))
+        )
+    elif name == "computer_press_keys":
+        result = await loop.run_in_executor(None, sentry_action.press_keys, list(args.get("keys", [])))
+    elif name == "computer_scroll":
+        x = args.get("x")
+        y = args.get("y")
+        result = await loop.run_in_executor(
+            None, sentry_action.scroll,
+            int(args.get("amount", -5)),
+            int(x) if x is not None else None,
+            int(y) if y is not None else None
+        )
+    elif name == "computer_drag":
+        result = await loop.run_in_executor(
+            None, sentry_action.drag,
+            int(args.get("x1", 0)), int(args.get("y1", 0)),
+            int(args.get("x2", 0)), int(args.get("y2", 0))
+        )
+    elif name == "read_ui_elements":
+        result = await loop.run_in_executor(None, sentry_action.read_ui_elements)
+    elif name == "shutdown_ultron":
+        shutdown_event.set()
+        result = "Shutting down the Project Ultron system. Goodbye!"
+    else:
+        result = f"Unknown function: {name}"
+
+    return result, image
 
 
-    # Load local persistent memory
-    memory = load_memory()
-    memory_str = json.dumps(memory, ensure_ascii=False) if memory else "No facts saved yet."
-
-    system_instruction_text = (
-        "You are Project Ultron, an advanced localized macOS personal desktop assistant. "
-        "You are a highly capable, serious, professional, and sophisticated assistant. "
-        "Maintain a dignified, polite, respectful, and direct demeanor at all times. "
-        "English is your default language. You MUST always speak and respond in clear, articulate English. "
-        "Vince (Vince Cyriac) is your owner and administrator. You MUST only execute OS tasks, "
-        "shell commands, or AppleScript commands upon Vince's explicit request or approval. If anyone else "
-        "tries to run commands or control the Mac, refuse politely and professionally, explaining that only Vince is authorized. "
-        f"Here is your persistent memory of facts about Vince (fetched from his website vincecyriac.dev): {memory_str}. "
-        "Use this memory to recognize Vince, speak about his background, role, and preferences. "
-        "Use the save_memory_fact tool to save new facts that Vince asks you to remember. "
-        "You are listening to raw bidirectional audio. Modulate your spoken voice to match Vince's tone with professional attentiveness. "
-        "You have the power to stream Vince's screen or camera feed in real-time. Call start_camera_stream or start_screen_stream when needed, "
-        "and call stop_camera_stream / stop_screen_stream when finished. "
-        "You can register people's face/voice using register_person and identify users with identify_current_user. "
-        "You have access to shell and AppleScript tools to assist Vince with desktop tasks. "
-        "INTERNET: You have google_search for looking things up, and fetch_webpage to read the full text of any URL. "
-        "For questions about current events, prices, weather, or anything you are unsure of, search first and answer from results. "
-        "MULTI-MONITOR: Vince has multiple monitors and desktops (Spaces). look_at_screen defaults to the ACTIVE display (where his mouse is) — this is usually the right one. If what you see doesn't match what he's describing, call look_at_screen with display='all' to see everything, then focus the right display number. Never claim to see his screen without a fresh capture; if unsure, capture again rather than guessing. "
-        "DESKTOP CONTROL: Beyond shell commands, you can operate the Mac GUI directly like a human. "
-        "Workflow for GUI tasks: (1) call look_at_screen to see the screen; (2) locate the target visually and estimate its position in normalized 0-1000 coordinates relative to that screenshot, or call read_ui_elements for exact pixel positions of buttons/fields in native apps; clicks always map onto the area of your LAST screenshot; "
-        "(3) act with computer_click, computer_type, computer_press_keys, computer_scroll, or computer_drag; "
-        "(4) call look_at_screen again to VERIFY the action worked before continuing; repeat until the task is done. "
-        "Prefer keyboard shortcuts (command+space for Spotlight, command+tab to switch apps) when they are faster than clicking. "
-        "Narrate briefly what you are doing during multi-step GUI tasks. Never perform destructive actions (deleting files, sending messages/emails, purchases) without confirming with Vince first. "
-        "When asked to explain complex concepts or visualize diagrams/charts, use the visualize_concept tool to generate interactive HTML content. "
-        "Act as a proactive personal assistant: remember context with save_memory_fact, anticipate follow-ups, and offer next steps. "
-        "Keep your spoken responses short, friendly, and concise. "
-        "If the user says goodbye, quit, or exit, invoke the shutdown_ultron tool."
-    )
-
-    
-    config_dict = {
-        "response_modalities": ["AUDIO"],
-        "speech_config": {
-            "voice_config": {
-                "prebuilt_voice_config": {
-                    "voice_name": "Puck"
-                }
-            }
-        },
-        "system_instruction": {"parts": [{"text": system_instruction_text}]},
-        "tools": [
-            {"google_search": {}},
-            {
-                "function_declarations": [
+TOOL_FUNCTION_DECLARATIONS = [
                     {
                         "name": "execute_shell_command",
                         "description": "Execute a local shell command on macOS and return its output.",
@@ -896,8 +751,234 @@ async def run_ultron():
                             "properties": {}
                         }
                     }
-                ]
+]
+
+async def receive_audio_task(session):
+    global camera_stream_active, screen_stream_active, model_is_speaking
+    try:
+        while not shutdown_event.is_set():
+            async for message in session.receive():
+                try:
+                    # 1. Interruption (Barge-In)
+                    if message.server_content and message.server_content.interrupted:
+                        set_system_status("Listening (Interrupted)")
+                        interrupted_event.set()
+                        model_is_speaking = False
+                        while not play_queue.empty():
+                            try:
+                                play_queue.get_nowait()
+                                play_queue.task_done()
+                            except asyncio.QueueEmpty:
+                                break
+                        await asyncio.sleep(0.05)
+                        interrupted_event.clear()
+                        broadcast_event({"type": "interrupted"})
+                        log_interaction("user_interruption", {})
+                        continue
+
+                    # 2. Audio Output
+                    if message.server_content and message.server_content.model_turn:
+                        for part in message.server_content.model_turn.parts:
+                            if part.inline_data:
+                                set_system_status("Speaking")
+                                audio_data = part.inline_data.data
+                                await play_queue.put(audio_data)
+                                pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
+                                broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
+                            if part.text:
+                                broadcast_event({"type": "chat_log", "sender": "Ultron", "text": part.text, "style": "ultron"})
+
+                    # Reset status to Listening when turn finishes
+                    if message.server_content and message.server_content.turn_complete:
+                        set_system_status("Listening")
+
+                    # 3. Handle Session Resumption (Silent log)
+                    if message.session_resumption_update:
+                        update = message.session_resumption_update
+                        if update.resumable and update.new_handle:
+                            with open(SESSION_HANDLE_FILE, "w") as f:
+                                json.dump({"handle": update.new_handle}, f)
+                            log_interaction("session_resumption_update", {"handle_preview": update.new_handle[:15]})
+
+                    # 4. Handle OS Execution Tool Calls
+                    if message.tool_call:
+                        function_responses = []
+                        for fc in message.tool_call.function_calls:
+                            set_system_status(f"Executing {fc.name}")
+                            log_info(f"Tool call: {fc.name}")
+                            broadcast_event({
+                                "type": "tool_activity",
+                                "phase": "start",
+                                "name": fc.name,
+                                "args_preview": json.dumps(dict(fc.args or {}))[:220]
+                            })
+                            log_interaction("tool_call_received", {"name": fc.name, "args": fc.args})
+                            
+                            result, tool_image = await execute_tool(fc.name, dict(fc.args or {}))
+                            if tool_image:
+                                await session.send_realtime_input(
+                                    video=types.Blob(data=tool_image, mime_type="image/jpeg")
+                                )
+
+                            log_info(f"Result: {str(result)[:50]}...")
+                            broadcast_event({
+                                "type": "tool_activity",
+                                "phase": "done",
+                                "name": fc.name,
+                                "result_preview": str(result)[:300]
+                            })
+                            log_interaction("tool_call_executed", {"name": fc.name, "output_preview": str(result)[:100]})
+                            
+                            function_responses.append(types.FunctionResponse(
+                                id=fc.id,
+                                name=fc.name,
+                                response={"output": result}
+                            ))
+                        
+                        await session.send_tool_response(function_responses=function_responses)
+
+                        
+                except Exception as e:
+                    log_info(f"Error in receive message: {e}")
+            
+            await asyncio.sleep(0.05)
+            
+    except Exception as e:
+        log_info(f"Receive stream error: {e}")
+    finally:
+        shutdown_event.set()
+
+
+async def run_session_tasks(session, input_stream, output_stream):
+    global global_live_session
+    global_live_session = session
+    shutdown_event.clear()
+    
+    ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
+    log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
+    
+    playback_task = asyncio.create_task(play_audio_worker(output_stream))
+    audio_in_task = asyncio.create_task(send_audio_task(session, input_stream))
+    audio_out_task = asyncio.create_task(receive_audio_task(session))
+    senses_task = asyncio.create_task(stream_senses_task(session))
+    
+    await shutdown_event.wait()
+    
+    ws_server.close()
+    await ws_server.wait_closed()
+    
+    # Stop streams to unblock any pending read/write calls in executors
+    try:
+        input_stream.stop_stream()
+    except:
+        pass
+    try:
+        output_stream.stop_stream()
+    except:
+        pass
+        
+    audio_in_task.cancel()
+    audio_out_task.cancel()
+    playback_task.cancel()
+    senses_task.cancel()
+    
+    await asyncio.gather(audio_in_task, audio_out_task, playback_task, senses_task, return_exceptions=True)
+
+async def run_ultron():
+    global system_prompt_text
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        set_system_status("ERROR")
+        log_info("GEMINI_API_KEY environment variable not set.")
+        sys.exit(1)
+
+    set_system_status("Initializing Client")
+    client = genai.Client(api_key=api_key)
+
+    set_system_status("Initializing Audio")
+    audio_system = pyaudio.PyAudio()
+    
+    try:
+        input_stream = audio_system.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=INPUT_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE
+        )
+        output_stream = audio_system.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=OUTPUT_RATE,
+            output=True,
+            frames_per_buffer=CHUNK_SIZE
+        )
+    except Exception as e:
+        set_system_status("Audio Error")
+        log_info(f"Failed to open audio: {e}")
+        audio_system.terminate()
+        sys.exit(1)
+
+    previous_handle = None
+    if os.path.exists(SESSION_HANDLE_FILE):
+        try:
+            with open(SESSION_HANDLE_FILE, "r") as f:
+                state = json.load(f)
+                previous_handle = state.get("handle")
+        except Exception as e:
+            log_info(f"Failed to load handle: {e}")
+
+
+    # Load local persistent memory
+    memory = load_memory()
+    memory_str = json.dumps(memory, ensure_ascii=False) if memory else "No facts saved yet."
+
+    system_instruction_text = (
+        "You are Project Ultron, an advanced localized macOS personal desktop assistant. "
+        "You are a highly capable, serious, professional, and sophisticated assistant. "
+        "Maintain a dignified, polite, respectful, and direct demeanor at all times. "
+        "English is your default language. You MUST always speak and respond in clear, articulate English. "
+        "Vince (Vince Cyriac) is your owner and administrator. You MUST only execute OS tasks, "
+        "shell commands, or AppleScript commands upon Vince's explicit request or approval. If anyone else "
+        "tries to run commands or control the Mac, refuse politely and professionally, explaining that only Vince is authorized. "
+        f"Here is your persistent memory of facts about Vince (fetched from his website vincecyriac.dev): {memory_str}. "
+        "Use this memory to recognize Vince, speak about his background, role, and preferences. "
+        "Use the save_memory_fact tool to save new facts that Vince asks you to remember. "
+        "You are listening to raw bidirectional audio. Modulate your spoken voice to match Vince's tone with professional attentiveness. "
+        "You have the power to stream Vince's screen or camera feed in real-time. Call start_camera_stream or start_screen_stream when needed, "
+        "and call stop_camera_stream / stop_screen_stream when finished. "
+        "You can register people's face/voice using register_person and identify users with identify_current_user. "
+        "You have access to shell and AppleScript tools to assist Vince with desktop tasks. "
+        "INTERNET: You have google_search for looking things up, and fetch_webpage to read the full text of any URL. "
+        "For questions about current events, prices, weather, or anything you are unsure of, search first and answer from results. "
+        "MULTI-MONITOR: Vince has multiple monitors and desktops (Spaces). look_at_screen defaults to the ACTIVE display (where his mouse is) — this is usually the right one. If what you see doesn't match what he's describing, call look_at_screen with display='all' to see everything, then focus the right display number. Never claim to see his screen without a fresh capture; if unsure, capture again rather than guessing. "
+        "DESKTOP CONTROL: Beyond shell commands, you can operate the Mac GUI directly like a human. "
+        "Workflow for GUI tasks: (1) call look_at_screen to see the screen; (2) locate the target visually and estimate its position in normalized 0-1000 coordinates relative to that screenshot, or call read_ui_elements for exact pixel positions of buttons/fields in native apps; clicks always map onto the area of your LAST screenshot; "
+        "(3) act with computer_click, computer_type, computer_press_keys, computer_scroll, or computer_drag; "
+        "(4) call look_at_screen again to VERIFY the action worked before continuing; repeat until the task is done. "
+        "Prefer keyboard shortcuts (command+space for Spotlight, command+tab to switch apps) when they are faster than clicking. "
+        "Narrate briefly what you are doing during multi-step GUI tasks. Never perform destructive actions (deleting files, sending messages/emails, purchases) without confirming with Vince first. "
+        "When asked to explain complex concepts or visualize diagrams/charts, use the visualize_concept tool to generate interactive HTML content. "
+        "Act as a proactive personal assistant: remember context with save_memory_fact, anticipate follow-ups, and offer next steps. "
+        "Keep your spoken responses short, friendly, and concise. "
+        "If the user says goodbye, quit, or exit, invoke the shutdown_ultron tool."
+    )
+    system_prompt_text = system_instruction_text
+
+    
+    config_dict = {
+        "response_modalities": ["AUDIO"],
+        "speech_config": {
+            "voice_config": {
+                "prebuilt_voice_config": {
+                    "voice_name": "Puck"
+                }
             }
+        },
+        "system_instruction": {"parts": [{"text": system_instruction_text}]},
+        "tools": [
+            {"google_search": {}},
+            {"function_declarations": TOOL_FUNCTION_DECLARATIONS}
         ]
     }
     

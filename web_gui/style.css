@@ -81,6 +81,22 @@ body {
 .status-chip.executing .status-dot { background: var(--amber); }
 .status-chip.error .status-dot { background: var(--red); }
 
+.model-select {
+  padding: 5px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-family: var(--font);
+  font-size: 12px;
+  max-width: 260px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.model-select:hover, .model-select:focus { border-color: var(--accent); color: var(--text); }
+
 .sense-chips { margin-left: auto; display: flex; gap: 8px; }
 
 .chip {

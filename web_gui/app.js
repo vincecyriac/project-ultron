@@ -45,6 +45,25 @@ const camPlaceholder = document.getElementById("cam-placeholder");
 const screenImgEl = document.getElementById("screen-img");
 const screenPlaceholder = document.getElementById("screen-placeholder");
 
+const modelSelectEl = document.getElementById("model-select");
+
+function populateModelList(models, activeId) {
+  modelSelectEl.innerHTML = "";
+  models.forEach((m) => {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.label;
+    modelSelectEl.appendChild(opt);
+  });
+  modelSelectEl.value = activeId;
+}
+
+modelSelectEl.addEventListener("change", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "select_model", id: modelSelectEl.value }));
+  }
+});
+
 const activityFeedEl = document.getElementById("activity-feed");
 const activityEmptyEl = document.getElementById("activity-empty");
 const actBadgeEl = document.getElementById("act-badge");
@@ -117,6 +136,16 @@ function handleServerMessage(msg) {
 
     case "tool_activity":
       addToolActivity(msg);
+      break;
+
+    case "model_list":
+      populateModelList(msg.models, msg.active_id);
+      break;
+
+    case "model_changed":
+      if (modelSelectEl.value !== msg.id) modelSelectEl.value = msg.id;
+      addChatMessage("System", `Model switched to ${msg.label}` +
+        (msg.model_type === "local" ? " — text chat mode (voice needs Gemini Live)." : "."), "system");
       break;
 
     case "interrupted":
