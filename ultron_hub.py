@@ -1,6 +1,7 @@
 import os
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 import sys
+import re
 import json
 import asyncio
 import pyaudio
@@ -27,6 +28,8 @@ import sentry_action
 import sentry_recognition
 import sentry_web
 import sentry_local
+import sentry_personal
+import sentry_scene
 
 # Load environment variables
 load_dotenv()
@@ -82,9 +85,12 @@ global_live_session = None
 active_model = {"type": "gemini", "id": MODEL_ID}
 local_client = None
 system_prompt_text = ""
+last_focus_note = ""
 
 def gemini_mode() -> bool:
     return active_model["type"] == "gemini"
+
+sentry_scene.set_broadcaster(lambda ev: broadcast_event(ev))
 
 def broadcast_event(data: dict):
     if not connected_ws_clients:
@@ -114,6 +120,7 @@ async def ws_handler(websocket):
         "models": get_model_registry(),
         "active_id": active_model["id"]
     }))
+    await websocket.send(json.dumps(sentry_scene.manager.workspace_snapshot()))
     try:
         async for message in websocket:
             try:
@@ -141,6 +148,27 @@ async def ws_handler(websocket):
                             turns=[{"role": "user", "parts": [{"text": text}]}],
                             turn_complete=True
                         )
+                elif msg_type == "sve_user_action":
+                    sentry_scene.manager.user_action(
+                        data.get("scene_id"), data.get("action"),
+                        data.get("object_id"), data.get("data")
+                    )
+                    # Point-and-ask: feed the model what the user is indicating,
+                    # so "what is this?" resolves to the pointed/selected object.
+                    if data.get("action") in ("select", "point_at") and data.get("object_id"):
+                        global last_focus_note
+                        note = sentry_scene.manager.focus_context()
+                        if note and note != last_focus_note and gemini_mode() and global_live_session:
+                            last_focus_note = note
+                            try:
+                                await global_live_session.send_client_content(
+                                    turns=[{"role": "user", "parts": [{"text":
+                                        f"[UI context, not a question — do not respond yet: Vince is now pointing at {note}. "
+                                        "If his next question says 'this' or 'it', he means that object.]"}]}],
+                                    turn_complete=False
+                                )
+                            except Exception:
+                                pass
                 elif msg_type == "select_model":
                     mid = data.get("id")
                     entry = next((m for m in get_model_registry() if m["id"] == mid), None)
@@ -298,11 +326,12 @@ async def stream_senses_task(session):
     global active_webcam, latest_webcam_frame_bytes
     webcam = sentry_vision.PersistentWebcam()
     active_webcam = webcam
+    loop = asyncio.get_running_loop()
     try:
         while not shutdown_event.is_set():
             try:
                 if screen_stream_active:
-                    screen_bytes = sentry_vision.capture_screen()
+                    screen_bytes = await loop.run_in_executor(None, sentry_vision.capture_screen, "active")
                     if screen_bytes:
                         b64 = base64.b64encode(screen_bytes).decode('utf-8')
                         broadcast_event({"type": "screen_frame", "image_base64": b64})
@@ -313,8 +342,8 @@ async def stream_senses_task(session):
                     await asyncio.sleep(0.8)
                 
                 if camera_stream_active:
-                    webcam.start()
-                    webcam_bytes = webcam.read_frame()
+                    await loop.run_in_executor(None, webcam.start)
+                    webcam_bytes = await loop.run_in_executor(None, webcam.read_frame)
                     if webcam_bytes:
                         latest_webcam_frame_bytes = webcam_bytes
                         b64 = base64.b64encode(webcam_bytes).decode('utf-8')
@@ -365,6 +394,9 @@ async def handle_local_chat(text: str):
             })
             log_interaction("tool_call_executed", {"name": name, "output_preview": str(result)[:100], "backend": "local"})
 
+        focus = sentry_scene.manager.focus_context()
+        if focus:
+            text = f"[Context: user is currently pointing at {focus}.]\n{text}"
         reply = await local_client.chat(text, system_prompt_text, execute_tool, on_tool, on_tool_done)
         if reply:
             broadcast_event({"type": "chat_log", "sender": "Ultron", "text": reply, "style": "ultron"})
@@ -376,6 +408,39 @@ async def handle_local_chat(text: str):
         })
     finally:
         set_system_status("Listening")
+
+def _parse_tool_json(raw, default):
+    """Lenient JSON parser for LLM tool args: tolerates code fences, trailing
+    commas, single quotes / Python literals, or already-structured values."""
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, (list, dict)):
+        return raw
+    s = str(raw).strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
+        s = re.sub(r"```\s*$", "", s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    no_trailing = re.sub(r",\s*([}\]])", r"\1", s)
+    try:
+        return json.loads(no_trailing)
+    except json.JSONDecodeError:
+        pass
+    try:
+        import ast
+        val = ast.literal_eval(s)
+        if isinstance(val, (list, dict)):
+            return val
+    except (ValueError, SyntaxError):
+        pass
+    raise ValueError(
+        f"invalid JSON near: '{s[:120]}...'. Re-emit STRICT JSON: double quotes only, "
+        "no trailing commas, no comments, no markdown fences. If the scene is large, "
+        "create it with fewer objects first and add the rest via update_3d_scene."
+    )
 
 async def execute_tool(name: str, args: dict) -> tuple:
     """Shared tool dispatcher for both the Gemini Live session and local models.
@@ -438,20 +503,27 @@ async def execute_tool(name: str, args: dict) -> tuple:
         result = f"Fact saved: '{key}' is now remembered as '{val}'."
     elif name == "retrieve_memory_facts":
         result = json.dumps(load_memory(), ensure_ascii=False)
-    elif name == "visualize_concept":
-        concept_name = args.get("concept_name")
-        html_content = args.get("html_content")
+    elif name == "create_3d_scene":
         try:
-            with open("ultron_visualization.html", "w", encoding="utf-8") as f:
-                f.write(html_content)
-            broadcast_event({
-                "type": "visualization",
-                "concept_name": concept_name,
-                "html_content": html_content
-            })
-            result = f"Successfully generated HTML visualization for '{concept_name}' and rendered inside the Desktop App GUI."
-        except Exception as e:
-            result = f"Error generating HTML visualization: {str(e)}"
+            objects = _parse_tool_json(args.get("objects_json"), [])
+            environment = _parse_tool_json(args.get("environment_json"), {})
+            result = sentry_scene.manager.create_scene(args.get("name", "Untitled"), objects, environment)
+        except ValueError as e:
+            log_interaction("scene_json_parse_error", {"raw_preview": str(args.get("objects_json"))[:300]})
+            result = f"[Error]: objects_json: {e}"
+    elif name == "update_3d_scene":
+        try:
+            operations = _parse_tool_json(args.get("operations_json"), [])
+            result = sentry_scene.manager.update_scene(args.get("scene", ""), operations)
+        except ValueError as e:
+            log_interaction("scene_json_parse_error", {"raw_preview": str(args.get("operations_json"))[:300]})
+            result = f"[Error]: operations_json: {e}"
+    elif name == "delete_3d_scene":
+        result = sentry_scene.manager.delete_scene(args.get("scene", ""))
+    elif name == "list_3d_scenes":
+        result = sentry_scene.manager.list_scenes()
+    elif name == "inspect_3d_scene":
+        result = sentry_scene.manager.describe_scene(args.get("scene", ""))
     elif name == "fetch_webpage":
         result = await sentry_web.fetch_webpage(args.get("url"))
     elif name == "computer_click":
@@ -484,6 +556,28 @@ async def execute_tool(name: str, args: dict) -> tuple:
         )
     elif name == "read_ui_elements":
         result = await loop.run_in_executor(None, sentry_action.read_ui_elements)
+    elif name == "list_open_windows":
+        result = await loop.run_in_executor(None, sentry_vision.list_open_windows)
+    elif name == "get_calendar_events":
+        result = await loop.run_in_executor(
+            None, sentry_personal.get_calendar_events,
+            int(args.get("days_ahead", 7)), int(args.get("days_back", 0))
+        )
+    elif name == "create_calendar_event":
+        result = await loop.run_in_executor(
+            None, sentry_personal.create_calendar_event,
+            args.get("title", "Untitled"), args.get("start_iso", ""),
+            int(args.get("duration_minutes", 60)), args.get("notes", "")
+        )
+    elif name == "get_recent_emails":
+        result = await loop.run_in_executor(
+            None, sentry_personal.get_recent_emails, int(args.get("count", 10))
+        )
+    elif name == "search_emails":
+        result = await loop.run_in_executor(
+            None, sentry_personal.search_emails,
+            args.get("query", ""), int(args.get("count", 8))
+        )
     elif name == "shutdown_ultron":
         shutdown_event.set()
         result = "Shutting down the Project Ultron system. Goodbye!"
@@ -636,21 +730,58 @@ TOOL_FUNCTION_DECLARATIONS = [
                         }
                     },
                     {
-                        "name": "visualize_concept",
-                        "description": "Visualize a concept by generating an interactive, beautiful HTML/CSS/JS page containing diagrams and explanatory graphics, and opening it in the user's default browser.",
+                        "name": "create_3d_scene",
+                        "description": "Create a live, persistent, interactive 3D scene in the Spatial workspace (renders instantly in the GUI and stays active). Use for ANY visualization request: astronomy, anatomy, architecture, flowcharts, networks, timelines, physics, molecules, data. Build scenes from primitive objects. objects_json is a JSON array of objects: {id, type (sphere|box|cylinder|cone|torus|ring|plane|line|text|points|group|arrow|capsule), position [x,y,z], rotation, scale, color '#hex', opacity, emissive, wireframe, label, parent (group id), size {radius|width|height|depth|tube|innerRadius|outerRadius}, points [[x,y,z],...] for line, text for text nodes, count+spread for points, animation {type: orbit|spin|pulse|bounce, speed, radius, center, axis}}. Give every meaningful object a human id ('sun', 'left_ventricle') and label. NEVER create a new scene for edits to an existing one — use update_3d_scene.",
                         "parameters": {
                             "type": "OBJECT",
                             "properties": {
-                                "concept_name": {
-                                    "type": "STRING",
-                                    "description": "The title or name of the concept (e.g. 'How Neural Networks Work')."
-                                },
-                                "html_content": {
-                                    "type": "STRING",
-                                    "description": "The complete, standalone HTML source code with inline CSS/JS containing visual diagrams, flowcharts, SVGs, or interactive elements."
-                                }
+                                "name": {"type": "STRING", "description": "Scene name shown in the workspace, e.g. 'Solar System'."},
+                                "objects_json": {"type": "STRING", "description": "JSON array of object specs (see tool description)."},
+                                "environment_json": {"type": "STRING", "description": "Optional JSON: {background '#hex', grid bool, stars bool, ambient 0-3, camera {position [x,y,z], target [x,y,z]}}."}
                             },
-                            "required": ["concept_name", "html_content"]
+                            "required": ["name", "objects_json"]
+                        }
+                    },
+                    {
+                        "name": "update_3d_scene",
+                        "description": "Edit an EXISTING live scene with object-level operations — never recreate a scene to change it. operations_json is a JSON array of ops: {action:'add', object:{...}} | {action:'update', id, changes:{any object fields}} | {action:'remove', id} | {action:'highlight'|'unhighlight'|'hide'|'show', id} | {action:'camera', camera:{position,target}} | {action:'environment', environment:{...}} | {action:'explode', factor} | {action:'style', mode:'wireframe'|'solid'}. Examples: rotate object = update rotation; make transparent = update opacity; zoom into X = camera op targeting X's position.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "scene": {"type": "STRING", "description": "Scene name or id."},
+                                "operations_json": {"type": "STRING", "description": "JSON array of operations (see tool description)."}
+                            },
+                            "required": ["scene", "operations_json"]
+                        }
+                    },
+                    {
+                        "name": "delete_3d_scene",
+                        "description": "Remove a scene from the Spatial workspace. Only when the user asks to close/delete it.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "scene": {"type": "STRING", "description": "Scene name or id."}
+                            },
+                            "required": ["scene"]
+                        }
+                    },
+                    {
+                        "name": "list_3d_scenes",
+                        "description": "List all active scenes in the Spatial workspace with their object ids and the user's current selection.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "inspect_3d_scene",
+                        "description": "Get the full JSON state of one scene (all objects with positions, colors, animations). Use before editing if unsure of current object ids or state.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "scene": {"type": "STRING", "description": "Scene name or id."}
+                            },
+                            "required": ["scene"]
                         }
                     },
                     {
@@ -741,6 +872,61 @@ TOOL_FUNCTION_DECLARATIONS = [
                         "parameters": {
                             "type": "OBJECT",
                             "properties": {}
+                        }
+                    },
+                    {
+                        "name": "list_open_windows",
+                        "description": "List all open windows across ALL monitors and virtual desktops (Spaces): app name, window title, and which display each is on, plus windows on hidden desktops. Use this when the user mentions an app/window you can't see in the screenshot, or to find where their work actually is. Windows on other desktops can't be captured until brought forward — activate the app first, then look_at_screen.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "get_calendar_events",
+                        "description": "Read the user's calendar events (all accounts configured on this Mac: iCloud, Google, Exchange). Use for questions about schedule, meetings, availability, or upcoming events.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "days_ahead": {"type": "INTEGER", "description": "How many days ahead to include (default 7)."},
+                                "days_back": {"type": "INTEGER", "description": "How many past days to include (default 0)."}
+                            }
+                        }
+                    },
+                    {
+                        "name": "create_calendar_event",
+                        "description": "Create a new event in the user's default calendar. Always confirm title and time with the user before creating.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "title": {"type": "STRING", "description": "Event title."},
+                                "start_iso": {"type": "STRING", "description": "Start time as 'YYYY-MM-DD HH:MM' (24h, local time)."},
+                                "duration_minutes": {"type": "INTEGER", "description": "Duration in minutes (default 60)."},
+                                "notes": {"type": "STRING", "description": "Optional notes/description."}
+                            },
+                            "required": ["title", "start_iso"]
+                        }
+                    },
+                    {
+                        "name": "get_recent_emails",
+                        "description": "Read the most recent emails from the user's inbox (Apple Mail): sender, subject, unread status, and a short preview of each.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "count": {"type": "INTEGER", "description": "Number of recent emails to fetch (default 10, max 25)."}
+                            }
+                        }
+                    },
+                    {
+                        "name": "search_emails",
+                        "description": "Search recent inbox emails by sender or subject text (Apple Mail).",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "query": {"type": "STRING", "description": "Text to match against sender or subject."},
+                                "count": {"type": "INTEGER", "description": "Max results (default 8)."}
+                            },
+                            "required": ["query"]
                         }
                     },
                     {
@@ -849,11 +1035,30 @@ async def receive_audio_task(session):
         shutdown_event.set()
 
 
+async def start_gui_server():
+    """Serves web_gui over HTTP so ES modules (Three.js) load reliably."""
+    from aiohttp import web
+    gui_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_gui")
+
+    async def index(request):
+        return web.FileResponse(os.path.join(gui_dir, "index.html"))
+
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_static("/", path=gui_dir)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 8766)
+    await site.start()
+    log_info("GUI server listening on http://127.0.0.1:8766")
+    return runner
+
 async def run_session_tasks(session, input_stream, output_stream):
     global global_live_session
     global_live_session = session
     shutdown_event.clear()
-    
+
+    gui_runner = await start_gui_server()
     ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
     log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
     
@@ -866,6 +1071,10 @@ async def run_session_tasks(session, input_stream, output_stream):
     
     ws_server.close()
     await ws_server.wait_closed()
+    try:
+        await gui_runner.cleanup()
+    except Exception:
+        pass
     
     # Stop streams to unblock any pending read/write calls in executors
     try:
@@ -951,14 +1160,17 @@ async def run_ultron():
         "You have access to shell and AppleScript tools to assist Vince with desktop tasks. "
         "INTERNET: You have google_search for looking things up, and fetch_webpage to read the full text of any URL. "
         "For questions about current events, prices, weather, or anything you are unsure of, search first and answer from results. "
-        "MULTI-MONITOR: Vince has multiple monitors and desktops (Spaces). look_at_screen defaults to the ACTIVE display (where his mouse is) — this is usually the right one. If what you see doesn't match what he's describing, call look_at_screen with display='all' to see everything, then focus the right display number. Never claim to see his screen without a fresh capture; if unsure, capture again rather than guessing. "
+        "MULTI-MONITOR & DESKTOPS: Vince has multiple monitors and virtual desktops (Spaces). look_at_screen defaults to the ACTIVE display — the one holding his frontmost (focused) window. Strategy when asked about his screen: (1) capture with default 'active'; (2) if what you see doesn't match what he describes, capture display='all' — each monitor is labeled with a red DISPLAY N badge — and identify the right one, then capture that display number for detail; (3) if the app/window he mentions appears on NO monitor, call list_open_windows — it may be on a hidden desktop; activate that app via AppleScript (tell application X to activate), which switches to its desktop, then capture again. Never describe his screen from memory or guesswork — always use a fresh capture. "
+        "PERSONAL DATA: You can read his calendar (get_calendar_events), create events (create_calendar_event — confirm before creating), and read/search his inbox (get_recent_emails, search_emails). Use these for schedule, availability, and email questions. "
         "DESKTOP CONTROL: Beyond shell commands, you can operate the Mac GUI directly like a human. "
         "Workflow for GUI tasks: (1) call look_at_screen to see the screen; (2) locate the target visually and estimate its position in normalized 0-1000 coordinates relative to that screenshot, or call read_ui_elements for exact pixel positions of buttons/fields in native apps; clicks always map onto the area of your LAST screenshot; "
         "(3) act with computer_click, computer_type, computer_press_keys, computer_scroll, or computer_drag; "
         "(4) call look_at_screen again to VERIFY the action worked before continuing; repeat until the task is done. "
         "Prefer keyboard shortcuts (command+space for Spotlight, command+tab to switch apps) when they are faster than clicking. "
         "Narrate briefly what you are doing during multi-step GUI tasks. Never perform destructive actions (deleting files, sending messages/emails, purchases) without confirming with Vince first. "
-        "When asked to explain complex concepts or visualize diagrams/charts, use the visualize_concept tool to generate interactive HTML content. "
+        "SPATIAL VISUALIZATION: When asked to visualize, explain, or diagram anything, build a live 3D scene with create_3d_scene (composed of primitive objects with meaningful ids and labels) — it renders instantly in the GUI's Spatial workspace and STAYS ACTIVE. Scenes are persistent digital objects: when the user says 'rotate it', 'highlight X', 'hide Y', 'make it transparent', 'zoom into Z', 'add W', edit the EXISTING scene with update_3d_scene operations — never recreate it. Use list_3d_scenes / inspect_3d_scene to recall what is on stage and what the user has selected. Multiple scenes can coexist; delete only when asked. "
+        "REALISM RULES for scenes: use real-world proportions, positions, and colors (scaled sensibly for viewing); set metalness/roughness to match the material (metal ~0.9/0.3, plastic ~0.1/0.5, organic ~0.0/0.8); light-emitting things (sun, lamps, screens) get emissive colors; space scenes get stars:true and dark background; compose complex shapes from multiple grouped primitives rather than one crude blob; add thin ring/line/label annotations sparingly. "
+        "POINTING: Vince can physically point at scene objects with his hand (camera gesture tracking). You receive UI context notes about which object he is pointing at — when he asks about 'this'/'it', answer about that object. "
         "Act as a proactive personal assistant: remember context with save_memory_fact, anticipate follow-ups, and offer next steps. "
         "Keep your spoken responses short, friendly, and concise. "
         "If the user says goodbye, quit, or exit, invoke the shutdown_ultron tool."

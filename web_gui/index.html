@@ -66,15 +66,17 @@
           </button>
         </div>
 
-        <div class="card feed-card">
-          <div class="feed-label">Camera</div>
+        <div class="card feed-card" id="cam-feed-card" style="display:none;">
+          <div class="feed-label" id="cam-feed-label">Camera</div>
           <div class="feed-body">
+            <video id="webcam-video" autoplay playsinline muted style="display:none;"></video>
             <img id="webcam-img" style="display:none;" />
+            <canvas id="cam-overlay"></canvas>
             <span class="feed-off" id="cam-placeholder">Off</span>
           </div>
         </div>
 
-        <div class="card feed-card">
+        <div class="card feed-card" id="screen-feed-card" style="display:none;">
           <div class="feed-label">Screen</div>
           <div class="feed-body">
             <img id="screen-img" style="display:none;" />
@@ -88,7 +90,7 @@
         <nav class="tabs">
           <button class="tab active" id="tab-chat-btn" onclick="switchTab('chat')">Chat</button>
           <button class="tab" id="tab-vis-btn" onclick="switchTab('vis')">
-            Visuals<span class="tab-badge" id="vis-badge"></span>
+            Spatial<span class="tab-badge" id="vis-badge"></span>
           </button>
           <button class="tab" id="tab-act-btn" onclick="switchTab('act')">
             Activity<span class="tab-badge" id="act-badge"></span>
@@ -113,19 +115,23 @@
           </div>
         </div>
 
-        <!-- Visuals -->
+        <!-- Spatial workspace (SVE) -->
         <div class="tab-view" id="tab-vis">
           <div class="vis-toolbar">
-            <span class="vis-name" id="vis-concept-name">Nothing rendered yet</span>
+            <div class="sve-scene-tabs" id="sve-scene-tabs"></div>
             <div class="vis-actions">
-              <button class="ghost-btn" onclick="reloadVisFrame()">Reload</button>
-              <button class="ghost-btn" onclick="toggleVisFullscreen()">Fullscreen</button>
+              <button class="ghost-btn" id="btn-hands" title="Hand gesture control (webcam)">✋ Hands</button>
+              <button class="ghost-btn" onclick="window.SVE && SVE.resetCamera()">Reset view</button>
             </div>
           </div>
-          <div class="vis-stage" id="vis-frame-container">
-            <iframe id="vis-iframe" sandbox="allow-scripts allow-same-origin"></iframe>
-            <div class="empty-state" id="vis-placeholder">
-              <p>Diagrams and interactive explanations Ultron generates appear here.</p>
+          <div class="sve-stage">
+            <div id="sve-viewport"></div>
+            <div class="gesture-cursor" id="gesture-cursor"></div>
+            <div class="gesture-hud" id="gesture-hud"></div>
+            <div class="sve-info" id="sve-info"></div>
+            <div class="empty-state" id="sve-empty">
+              <p>Ask Ultron to visualize anything — scenes render here as live 3D objects.
+              Drag to orbit, scroll to zoom, click objects to select, F to focus, Del to remove.</p>
             </div>
           </div>
         </div>
@@ -142,6 +148,11 @@
     </main>
   </div>
 
+  <script type="importmap">
+    { "imports": { "three": "./vendor/three.module.min.js" } }
+  </script>
+  <script type="module" src="sve.js"></script>
+  <script type="module" src="gestures.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

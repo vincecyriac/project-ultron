@@ -35,9 +35,6 @@ const chatMessagesEl = document.getElementById("chat-messages");
 const chatInputEl = document.getElementById("chat-input");
 const sendBtnEl = document.getElementById("send-btn");
 
-const visIframe = document.getElementById("vis-iframe");
-const visPlaceholder = document.getElementById("vis-placeholder");
-const visConceptNameEl = document.getElementById("vis-concept-name");
 const visBadgeEl = document.getElementById("vis-badge");
 
 const camImgEl = document.getElementById("webcam-img");
@@ -110,12 +107,23 @@ function handleServerMessage(msg) {
       addChatMessage(msg.sender, msg.text, msg.style);
       break;
 
-    case "visualization":
-      renderVisualization(msg.concept_name, msg.html_content);
+    case "sve_workspace":
+    case "sve_scene_create":
+    case "sve_scene_update":
+    case "sve_scene_delete": {
+      const wantsAttention = window.SVE && window.SVE.handleEvent(msg);
+      if (wantsAttention && !document.getElementById("tab-vis").classList.contains("active")) {
+        visBadgeEl.classList.add("active");
+      }
+      if (msg.type === "sve_scene_create") switchTab("vis");
+      syncGesturesToWorkspace();
       break;
+    }
 
     case "camera_frame":
-      if (msg.image_base64) {
+      // Backend JPEG frames feed Gemini; preview uses the local 30fps
+      // getUserMedia stream instead. Fallback to JPEGs only if that failed.
+      if (msg.image_base64 && !UltronCamera.active()) {
         camImgEl.src = "data:image/jpeg;base64," + msg.image_base64;
         camImgEl.style.display = "block";
         camPlaceholder.style.display = "none";
@@ -182,6 +190,78 @@ function updateStatus(status) {
   }
 }
 
+// Shared, refcounted webcam stream: live preview + gesture tracker use one
+// getUserMedia stream (30fps) instead of the backend's 0.8s JPEG feed.
+const UltronCamera = {
+  stream: null,
+  refs: 0,
+  async acquire() {
+    this.refs++;
+    if (!this.stream) {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      });
+    }
+    return this.stream;
+  },
+  release() {
+    this.refs = Math.max(0, this.refs - 1);
+    if (this.refs === 0 && this.stream) {
+      this.stream.getTracks().forEach((t) => t.stop());
+      this.stream = null;
+    }
+  },
+  active() {
+    return !!this.stream;
+  },
+};
+window.UltronCamera = UltronCamera;
+
+const camVideoEl = document.getElementById("webcam-video");
+const camFeedCard = document.getElementById("cam-feed-card");
+const screenFeedCard = document.getElementById("screen-feed-card");
+const camFeedLabel = document.getElementById("cam-feed-label");
+let previewOn = false;
+
+// Feed cards render only while their source is live.
+function updateFeedCards() {
+  const gestures = window.UltronGestures?.running;
+  const camLive = previewOn || isCamActive || gestures;
+  camFeedCard.style.display = camLive ? "" : "none";
+  camFeedLabel.textContent = gestures ? "Camera · hand tracking" : "Camera";
+  screenFeedCard.style.display = isScreenActive ? "" : "none";
+}
+
+window.addEventListener("ultron-gesture-state", (e) => {
+  if (e.detail.running) {
+    startLocalPreview();
+  } else if (!isCamActive) {
+    stopLocalPreview();
+  }
+  updateFeedCards();
+});
+
+async function startLocalPreview() {
+  if (previewOn) return;
+  try {
+    camVideoEl.srcObject = await UltronCamera.acquire();
+    previewOn = true;
+    camVideoEl.style.display = "block";
+    camImgEl.style.display = "none";
+    camPlaceholder.style.display = "none";
+  } catch (e) {
+    console.warn("Local camera preview failed, falling back to backend frames:", e);
+  }
+}
+
+function stopLocalPreview() {
+  if (!previewOn) return;
+  previewOn = false;
+  camVideoEl.srcObject = null;
+  camVideoEl.style.display = "none";
+  UltronCamera.release();
+}
+
 function updateSenseBadges(camActive, screenActive) {
   isCamActive = camActive;
   isScreenActive = screenActive;
@@ -189,10 +269,14 @@ function updateSenseBadges(camActive, screenActive) {
   senseCamEl.classList.toggle("active", camActive);
   btnCam.classList.toggle("active", camActive);
   btnCam.querySelector(".btn-lbl").textContent = camActive ? "Camera on" : "Camera";
-  if (!camActive) {
+  if (camActive) {
+    startLocalPreview();
+  } else if (!window.UltronGestures?.running) {
+    stopLocalPreview();
     camImgEl.style.display = "none";
     camPlaceholder.style.display = "block";
   }
+  updateFeedCards();
 
   senseScreenEl.classList.toggle("active", screenActive);
   btnScreen.classList.toggle("active", screenActive);
@@ -336,31 +420,32 @@ function switchTab(tabName) {
 
   if (tabName === "vis") visBadgeEl.classList.remove("active");
   if (tabName === "act") actBadgeEl.classList.remove("active");
+  syncGesturesToWorkspace();
 }
 
-// ---------- Visualizations ----------
-
-function renderVisualization(conceptName, htmlContent) {
-  visConceptNameEl.textContent = conceptName;
-  visPlaceholder.style.display = "none";
-  visIframe.srcdoc = htmlContent;
-
-  switchTab("vis");
-  visBadgeEl.classList.add("active");
-}
-
-function reloadVisFrame() {
-  visIframe.srcdoc = visIframe.srcdoc;
-}
-
-function toggleVisFullscreen() {
-  const container = document.getElementById("vis-frame-container");
-  if (!document.fullscreenElement) {
-    container.requestFullscreen().catch((err) => console.error(err));
-  } else {
-    document.exitFullscreen();
+// Hands-on by default whenever the Spatial tab is showing a live scene;
+// off (camera released) when leaving it or when the workspace empties.
+function syncGesturesToWorkspace() {
+  const g = window.UltronGestures;
+  if (!g || !window.SVE) return;
+  const spatialVisible = document.getElementById("tab-vis").classList.contains("active");
+  if (spatialVisible && window.SVE.hasActiveScene()) {
+    if (!g.running && !g.starting) g.start();
+  } else if (g.running) {
+    g.stop();
   }
 }
+
+// Watchdog: recovers from transient start failures (permission just granted,
+// GPU delegate fallback, camera briefly busy) without user interaction.
+setInterval(syncGesturesToWorkspace, 5000);
+
+// ---------- SVE bridge ----------
+
+// sve.js (module) calls this to report user interactions back to the engine.
+window.sveSend = (obj) => {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+};
 
 // ---------- Tool Activity ----------
 

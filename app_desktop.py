@@ -23,15 +23,15 @@ def main():
     # Allow WebSocket server time to bind port
     time.sleep(5.0)
     
-    # 2. Locate web_gui index.html
-    html_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "web_gui", "index.html"))
-    
+    # 2. GUI is served by the backend over HTTP (needed for ES module imports)
+    gui_url = "http://127.0.0.1:8766/"
+
     try:
         import webview
-        print(f"[Ultron Desktop] Launching PyWebView Desktop GUI: file://{html_path}")
+        print(f"[Ultron Desktop] Launching PyWebView Desktop GUI: {gui_url}")
         window = webview.create_window(
             title="Project Ultron - AI Desktop Assistant",
-            url=f"file://{html_path}",
+            url=gui_url,
             width=1280,
             height=850,
             resizable=True,
@@ -41,8 +41,8 @@ def main():
         webview.start(debug=False)
     except Exception as e:
         import webbrowser
-        print(f"[Ultron Desktop] Opening Web GUI in default browser: file://{html_path}")
-        webbrowser.open(f"file://{html_path}")
+        print(f"[Ultron Desktop] Opening Web GUI in default browser: {gui_url}")
+        webbrowser.open(gui_url)
         try:
             backend_thread.join()
         except KeyboardInterrupt:
