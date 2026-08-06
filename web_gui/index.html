@@ -67,7 +67,10 @@
         </div>
 
         <div class="card feed-card" id="cam-feed-card" style="display:none;">
-          <div class="feed-label" id="cam-feed-label">Camera</div>
+          <div class="feed-head">
+            <div class="feed-label" id="cam-feed-label">Camera</div>
+            <button class="ghost-btn" id="btn-cam-flip" style="display:none;" title="Switch front/rear camera">🔄 Flip</button>
+          </div>
           <div class="feed-body">
             <video id="webcam-video" autoplay playsinline muted style="display:none;"></video>
             <img id="webcam-img" style="display:none;" />
@@ -146,6 +149,19 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- Remote command approval (shown when a Tailscale session asks to run shell/AppleScript) -->
+  <div class="exec-approval" id="exec-approval" style="display:none;">
+    <div class="exec-approval-box">
+      <div class="exec-approval-title">⚠ Command approval required</div>
+      <div class="exec-approval-tool" id="exec-approval-tool">Shell command</div>
+      <pre class="exec-approval-cmd" id="exec-approval-cmd"></pre>
+      <div class="exec-approval-actions">
+        <button class="exec-btn deny" id="exec-deny">Deny</button>
+        <button class="exec-btn approve" id="exec-approve">Run it</button>
+      </div>
+    </div>
   </div>
 
   <script type="importmap">

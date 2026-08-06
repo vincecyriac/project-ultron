@@ -3,6 +3,8 @@ os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 import sys
 import re
 import json
+import time
+import uuid
 import asyncio
 import pyaudio
 import cv2
@@ -81,6 +83,11 @@ mic_audio_buffer = bytearray()
 MAX_BUFFER_SIZE = 320000  # 10 seconds of 16kHz 16-bit PCM (voice enrollment window)
 model_is_speaking = False
 connected_ws_clients = set()
+remote_ws_clients = set()  # clients reached via Tailscale Serve (phone, other devices)
+pending_exec_approvals = {}  # approval_id -> asyncio.Future[bool]
+latest_remote_frame_bytes = None  # last camera frame pushed by a remote client
+latest_remote_frame_ts = 0.0
+camera_source = {"mode": "auto"}  # auto = phone camera when remote session live; mac = force Mac webcam
 global_live_session = None
 active_model = {"type": "gemini", "id": MODEL_ID}
 local_client = None
@@ -107,9 +114,69 @@ def set_system_status(status_str: str):
     broadcast_event({"type": "status", "status": status_str})
 
 
+def remote_frame_fresh() -> bool:
+    return latest_remote_frame_bytes is not None and (time.time() - latest_remote_frame_ts) < 5.0
+
+def remote_session_active() -> bool:
+    return bool(remote_ws_clients)
+
+async def notify_session_remote_change(connected: bool):
+    """Tells the live model which device Vince is on, so senses default correctly."""
+    if not (gemini_mode() and global_live_session):
+        return
+    if connected:
+        note = ("[System note, do not respond: Vince just connected remotely from his phone. "
+                "His phone microphone and phone camera are now the PRIMARY senses — camera tools "
+                "default to the phone camera automatically. The Mac's webcam and screen belong to "
+                "his unattended laptop: do NOT capture or stream them unless Vince explicitly asks "
+                "for the laptop/Mac camera or screen.]")
+    else:
+        note = ("[System note, do not respond: the remote phone session ended. Vince is back at "
+                "the Mac; its webcam and screen are the primary senses again.]")
+    try:
+        await global_live_session.send_client_content(
+            turns=[{"role": "user", "parts": [{"text": note}]}],
+            turn_complete=False
+        )
+    except Exception:
+        pass
+
+
+async def request_exec_approval(tool_name: str, preview: str) -> bool:
+    """Asks connected GUI clients to approve a shell/AppleScript command while a
+    remote (Tailscale) session is active. Deny on timeout or disconnect."""
+    approval_id = uuid.uuid4().hex
+    fut = asyncio.get_running_loop().create_future()
+    pending_exec_approvals[approval_id] = fut
+    broadcast_event({
+        "type": "exec_approval_request",
+        "id": approval_id,
+        "tool": tool_name,
+        "preview": preview
+    })
+    set_system_status("Awaiting approval")
+    try:
+        return await asyncio.wait_for(fut, timeout=45)
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        pending_exec_approvals.pop(approval_id, None)
+        broadcast_event({"type": "exec_approval_closed", "id": approval_id})
+
+
 async def ws_handler(websocket):
     global camera_stream_active, screen_stream_active, model_is_speaking, mic_audio_buffer
+    global latest_remote_frame_bytes, latest_remote_frame_ts
     connected_ws_clients.add(websocket)
+    # Tailscale Serve proxies from localhost but stamps X-Forwarded-For;
+    # direct local browsers connect without it.
+    try:
+        if websocket.request and websocket.request.headers.get("X-Forwarded-For"):
+            remote_ws_clients.add(websocket)
+            log_info("Remote client connected (via Tailscale).")
+            await notify_session_remote_change(connected=True)
+    except Exception:
+        pass
     await websocket.send(json.dumps({
         "type": "sense_update",
         "camera_active": camera_stream_active,
@@ -126,7 +193,29 @@ async def ws_handler(websocket):
             try:
                 data = json.loads(message)
                 msg_type = data.get("type")
-                if msg_type == "audio_in":
+                if msg_type == "client_hello":
+                    # Fallback remote flag from the page itself (non-localhost origin)
+                    if data.get("remote") and websocket not in remote_ws_clients:
+                        remote_ws_clients.add(websocket)
+                        log_info("Remote client connected (self-reported).")
+                        await notify_session_remote_change(connected=True)
+                elif msg_type == "remote_camera_frame":
+                    # Phone camera frame: becomes the primary visual feed while
+                    # the remote session is live (unless Mac cam was forced).
+                    b64 = data.get("image_base64")
+                    if b64 and websocket in remote_ws_clients:
+                        latest_remote_frame_bytes = base64.b64decode(b64)
+                        latest_remote_frame_ts = time.time()
+                        if camera_stream_active and camera_source["mode"] != "mac" \
+                                and gemini_mode() and global_live_session:
+                            await global_live_session.send_realtime_input(
+                                video=types.Blob(data=latest_remote_frame_bytes, mime_type="image/jpeg")
+                            )
+                elif msg_type == "exec_approval_response":
+                    fut = pending_exec_approvals.get(data.get("id"))
+                    if fut and not fut.done():
+                        fut.set_result(bool(data.get("approved")))
+                elif msg_type == "audio_in":
                     pcm_b64 = data.get("pcm_base64")
                     if pcm_b64:
                         pcm_bytes = base64.b64decode(pcm_b64)
@@ -214,11 +303,22 @@ async def ws_handler(websocket):
             except Exception as e:
                 pass
     finally:
-        connected_ws_clients.remove(websocket)
+        connected_ws_clients.discard(websocket)
+        was_remote = websocket in remote_ws_clients
+        remote_ws_clients.discard(websocket)
+        if was_remote and not remote_ws_clients:
+            latest_remote_frame_bytes = None
+            try:
+                await notify_session_remote_change(connected=False)
+            except Exception:
+                pass
 
 
 def _current_webcam_frame() -> bytes:
-    """Best available webcam frame: live stream frame if streaming, else one-shot capture."""
+    """Best available camera frame: phone camera while a remote session is live,
+    else live Mac stream frame, else one-shot Mac capture."""
+    if camera_source["mode"] != "mac" and remote_frame_fresh():
+        return latest_remote_frame_bytes
     if active_webcam and camera_stream_active:
         frame = active_webcam.read_frame()
         if frame:
@@ -280,7 +380,14 @@ async def play_audio_worker(output_stream):
             if interrupted_event.is_set():
                 play_queue.task_done()
                 continue
-            
+            if remote_ws_clients:
+                # Remote session: the phone plays Ultron's voice; keep the
+                # Mac's speakers silent to avoid double audio.
+                play_queue.task_done()
+                if play_queue.empty():
+                    model_is_speaking = False
+                continue
+
             model_is_speaking = True
             await loop.run_in_executor(None, output_stream.write, chunk)
             play_queue.task_done()
@@ -342,17 +449,24 @@ async def stream_senses_task(session):
                     await asyncio.sleep(0.8)
                 
                 if camera_stream_active:
-                    await loop.run_in_executor(None, webcam.start)
-                    webcam_bytes = await loop.run_in_executor(None, webcam.read_frame)
-                    if webcam_bytes:
-                        latest_webcam_frame_bytes = webcam_bytes
-                        b64 = base64.b64encode(webcam_bytes).decode('utf-8')
-                        broadcast_event({"type": "camera_frame", "image_base64": b64})
-                        if gemini_mode():
-                            await session.send_realtime_input(
-                                video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
-                            )
-                    await asyncio.sleep(0.8)
+                    if camera_source["mode"] != "mac" and remote_session_active():
+                        # Phone camera is primary: frames arrive via WS and are
+                        # forwarded on receipt. Keep the Mac webcam off.
+                        webcam.stop()
+                        latest_webcam_frame_bytes = None
+                        await asyncio.sleep(0.8)
+                    else:
+                        await loop.run_in_executor(None, webcam.start)
+                        webcam_bytes = await loop.run_in_executor(None, webcam.read_frame)
+                        if webcam_bytes:
+                            latest_webcam_frame_bytes = webcam_bytes
+                            b64 = base64.b64encode(webcam_bytes).decode('utf-8')
+                            broadcast_event({"type": "camera_frame", "image_base64": b64})
+                            if gemini_mode():
+                                await session.send_realtime_input(
+                                    video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
+                                )
+                        await asyncio.sleep(0.8)
                 else:
                     webcam.stop()
                     latest_webcam_frame_bytes = None
@@ -452,6 +566,17 @@ async def execute_tool(name: str, args: dict) -> tuple:
     result = ""
     image = None
 
+    if name in ("execute_shell_command", "execute_applescript_task") and remote_ws_clients:
+        # Remote session active: command must be approved on a connected device
+        # before touching the machine. Deterministic gate — not model-mediated.
+        preview = args.get("command") or args.get("script") or ""
+        approved = await request_exec_approval(name, str(preview)[:500])
+        log_interaction("remote_exec_approval", {"tool": name, "approved": approved, "preview": str(preview)[:100]})
+        if not approved:
+            return ("[Blocked]: A remote session is active and this command was not approved "
+                    "on Vince's device (denied or timed out). It was NOT executed. "
+                    "Tell the user approval is required on screen.", None)
+
     if name == "execute_shell_command":
         result = await loop.run_in_executor(None, sentry_exec.execute_shell, args.get("command", ""))
     elif name == "execute_applescript_task":
@@ -469,19 +594,32 @@ async def execute_tool(name: str, args: dict) -> tuple:
         else:
             result = "Error: Failed to capture screen. Verify Screen Recording permissions."
     elif name == "look_at_webcam":
-        image = await loop.run_in_executor(None, sentry_vision.capture_webcam)
-        if image:
-            result = "Webcam frame captured successfully and loaded into your visual sensor. Tell the user what you see."
+        source = (args.get("source") or "auto").lower()
+        if source != "mac" and remote_session_active():
+            image = latest_remote_frame_bytes if remote_frame_fresh() else None
+            if image:
+                result = "Phone camera frame captured (Vince's remote session) and loaded into your visual sensor. Tell the user what you see."
+            else:
+                result = ("Vince is connected from his phone but no phone camera frame is available yet. "
+                          "Ask him to tap the Camera button on his phone (or say 'use the Mac camera' to force the laptop webcam).")
         else:
-            result = "Error: Failed to capture webcam. Verify camera access permissions."
+            image = await loop.run_in_executor(None, sentry_vision.capture_webcam)
+            if image:
+                result = "Mac webcam frame captured successfully and loaded into your visual sensor. Tell the user what you see."
+            else:
+                result = "Error: Failed to capture webcam. Verify camera access permissions."
     elif name == "start_camera_stream":
+        camera_source["mode"] = "mac" if (args.get("source") or "auto").lower() == "mac" else "auto"
         camera_stream_active = True
         broadcast_event({"type": "sense_update", "camera_active": True, "screen_active": screen_stream_active})
-        result = f"Webcam continuous streaming started. Reason: '{args.get('reason', '')}'."
+        src_note = "Mac webcam (forced)" if camera_source["mode"] == "mac" else \
+            ("phone camera" if remote_session_active() else "Mac webcam")
+        result = f"Camera streaming started using the {src_note}. Reason: '{args.get('reason', '')}'."
     elif name == "stop_camera_stream":
         camera_stream_active = False
+        camera_source["mode"] = "auto"
         broadcast_event({"type": "sense_update", "camera_active": False, "screen_active": screen_stream_active})
-        result = "Webcam continuous streaming stopped."
+        result = "Camera streaming stopped."
     elif name == "start_screen_stream":
         screen_stream_active = True
         broadcast_event({"type": "sense_update", "camera_active": camera_stream_active, "screen_active": True})
@@ -631,21 +769,30 @@ TOOL_FUNCTION_DECLARATIONS = [
                     },
                     {
                         "name": "look_at_webcam",
-                        "description": "Capture a single frame from the user's default webcam and load it into your visual sensor. Use this when the user asks you to look at them, check the camera feed, or see their physical surroundings.",
+                        "description": "Capture a single camera frame and load it into your visual sensor. Use this when the user asks you to look at them, check the camera feed, or see their physical surroundings. When Vince is connected remotely from his phone, this automatically uses his PHONE camera; pass source='mac' only if he explicitly asks for the laptop/Mac webcam.",
                         "parameters": {
                             "type": "OBJECT",
-                            "properties": {}
+                            "properties": {
+                                "source": {
+                                    "type": "STRING",
+                                    "description": "'auto' (default: phone camera during a remote session, else Mac webcam) or 'mac' to force the Mac's webcam."
+                                }
+                            }
                         }
                     },
                     {
                         "name": "start_camera_stream",
-                        "description": "Start continuous real-time streaming of the webcam feed. Use this when you decide you need to watch the user, check their movements, recognize their face, or see what they are doing in real-time.",
+                        "description": "Start continuous real-time camera streaming. Use this when you decide you need to watch the user, check their movements, recognize their face, or see what they are doing in real-time. When Vince is connected remotely from his phone, this automatically streams his PHONE camera; pass source='mac' only if he explicitly asks for the laptop/Mac webcam.",
                         "parameters": {
                             "type": "OBJECT",
                             "properties": {
                                 "reason": {
                                     "type": "STRING",
                                     "description": "The reason why you need to enable the camera feed."
+                                },
+                                "source": {
+                                    "type": "STRING",
+                                    "description": "'auto' (default: phone camera during a remote session, else Mac webcam) or 'mac' to force the Mac's webcam."
                                 }
                             },
                             "required": ["reason"]
@@ -1156,6 +1303,11 @@ async def run_ultron():
         "You are listening to raw bidirectional audio. Modulate your spoken voice to match Vince's tone with professional attentiveness. "
         "You have the power to stream Vince's screen or camera feed in real-time. Call start_camera_stream or start_screen_stream when needed, "
         "and call stop_camera_stream / stop_screen_stream when finished. "
+        "REMOTE SESSIONS: Vince can connect from his phone over his private network (you will receive a system note when this happens). "
+        "While he is remote, his phone microphone and phone camera are the PRIMARY senses: camera tools default to the phone camera automatically. "
+        "The Mac's webcam and screen belong to his unattended laptop — do NOT capture, stream, or describe them during a remote session unless "
+        "Vince explicitly asks for the laptop/Mac camera or screen (then use source='mac' for camera tools). "
+        "Shell and AppleScript commands during a remote session require Vince's on-screen approval; if a command is blocked, tell him it awaits approval on his device. "
         "You can register people's face/voice using register_person and identify users with identify_current_user. "
         "You have access to shell and AppleScript tools to assist Vince with desktop tasks. "
         "INTERNET: You have google_search for looking things up, and fetch_webpage to read the full text of any URL. "

@@ -66,14 +66,23 @@ const activityEmptyEl = document.getElementById("activity-empty");
 const actBadgeEl = document.getElementById("act-badge");
 const pendingActivities = {};
 
+// Remote = served through Tailscale (HTTPS, non-localhost). Remote clients
+// play Ultron's voice in the browser; local ones rely on the Mac's speakers.
+const IS_REMOTE = !["127.0.0.1", "localhost", ""].includes(window.location.hostname);
+
 // ---------- WebSocket ----------
 
 function initWebSocket() {
-  const wsUrl = `ws://${window.location.hostname || "127.0.0.1"}:8765`;
+  // Over HTTPS (Tailscale Serve) the WS is mounted on the same origin at /ws;
+  // plain local access connects straight to the gateway port.
+  const wsUrl = window.location.protocol === "https:"
+    ? `wss://${window.location.host}/ws`
+    : `ws://${window.location.hostname || "127.0.0.1"}:8765`;
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     updateStatus("Listening");
+    ws.send(JSON.stringify({ type: "client_hello", remote: IS_REMOTE }));
     initMicrophone();
   };
 
@@ -101,6 +110,15 @@ function handleServerMessage(msg) {
       modelSpeaking = true;
       audioStateTagEl.textContent = "Speaking";
       brandMarkEl.classList.add("speaking");
+      if (IS_REMOTE && msg.pcm_base64) playPcmChunk(msg.pcm_base64);
+      break;
+
+    case "exec_approval_request":
+      showExecApproval(msg);
+      break;
+
+    case "exec_approval_closed":
+      closeExecApproval(msg.id);
       break;
 
     case "chat_log":
@@ -160,6 +178,7 @@ function handleServerMessage(msg) {
       modelSpeaking = false;
       audioStateTagEl.textContent = "Interrupted";
       brandMarkEl.classList.remove("speaking");
+      flushPlayback();
       break;
   }
 }
@@ -192,15 +211,17 @@ function updateStatus(status) {
 
 // Shared, refcounted webcam stream: live preview + gesture tracker use one
 // getUserMedia stream (30fps) instead of the backend's 0.8s JPEG feed.
+let remoteCamFacing = "environment"; // phone default: rear camera (show surroundings)
+
 const UltronCamera = {
   stream: null,
   refs: 0,
   async acquire() {
     this.refs++;
     if (!this.stream) {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-      });
+      const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+      if (IS_REMOTE) video.facingMode = remoteCamFacing;
+      this.stream = await navigator.mediaDevices.getUserMedia({ video });
     }
     return this.stream;
   },
@@ -210,6 +231,16 @@ const UltronCamera = {
       this.stream.getTracks().forEach((t) => t.stop());
       this.stream = null;
     }
+  },
+  // Re-open with current constraints (camera flip) keeping refcount intact.
+  async restart() {
+    if (!this.stream) return null;
+    this.stream.getTracks().forEach((t) => t.stop());
+    this.stream = null;
+    const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+    if (IS_REMOTE) video.facingMode = remoteCamFacing;
+    this.stream = await navigator.mediaDevices.getUserMedia({ video });
+    return this.stream;
   },
   active() {
     return !!this.stream;
@@ -271,10 +302,14 @@ function updateSenseBadges(camActive, screenActive) {
   btnCam.querySelector(".btn-lbl").textContent = camActive ? "Camera on" : "Camera";
   if (camActive) {
     startLocalPreview();
-  } else if (!window.UltronGestures?.running) {
-    stopLocalPreview();
-    camImgEl.style.display = "none";
-    camPlaceholder.style.display = "block";
+    if (IS_REMOTE) startRemoteCamPush();
+  } else {
+    stopRemoteCamPush();
+    if (!window.UltronGestures?.running) {
+      stopLocalPreview();
+      camImgEl.style.display = "none";
+      camPlaceholder.style.display = "block";
+    }
   }
   updateFeedCards();
 
@@ -285,6 +320,54 @@ function updateSenseBadges(camActive, screenActive) {
     screenImgEl.style.display = "none";
     screenPlaceholder.style.display = "block";
   }
+}
+
+// ---------- Phone camera push (remote sessions) ----------
+// While a remote session streams the camera, the phone captures ~1fps JPEG
+// frames and ships them to the hub, which feeds them to the model instead of
+// the Mac webcam.
+
+let remoteCamTimer = null;
+const remoteCamCanvas = document.createElement("canvas");
+
+async function startRemoteCamPush() {
+  if (!IS_REMOTE || remoteCamTimer) return;
+  await startLocalPreview();
+  remoteCamTimer = setInterval(pushRemoteCamFrame, 1000);
+}
+
+function stopRemoteCamPush() {
+  if (remoteCamTimer) {
+    clearInterval(remoteCamTimer);
+    remoteCamTimer = null;
+  }
+}
+
+function pushRemoteCamFrame() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const vw = camVideoEl.videoWidth;
+  const vh = camVideoEl.videoHeight;
+  if (!vw || !vh) return;
+  const scale = Math.min(1, 1024 / vw);
+  remoteCamCanvas.width = Math.round(vw * scale);
+  remoteCamCanvas.height = Math.round(vh * scale);
+  remoteCamCanvas.getContext("2d").drawImage(camVideoEl, 0, 0, remoteCamCanvas.width, remoteCamCanvas.height);
+  const dataUrl = remoteCamCanvas.toDataURL("image/jpeg", 0.7);
+  ws.send(JSON.stringify({ type: "remote_camera_frame", image_base64: dataUrl.split(",")[1] }));
+}
+
+const camFlipBtn = document.getElementById("btn-cam-flip");
+if (IS_REMOTE && camFlipBtn) {
+  camFlipBtn.style.display = "";
+  camFlipBtn.addEventListener("click", async () => {
+    remoteCamFacing = remoteCamFacing === "environment" ? "user" : "environment";
+    try {
+      const stream = await UltronCamera.restart();
+      if (stream) camVideoEl.srcObject = stream;
+    } catch (e) {
+      console.warn("Camera flip failed:", e);
+    }
+  });
 }
 
 // ---------- Microphone ----------
@@ -342,6 +425,102 @@ function arrayBufferToBase64(buffer) {
   }
   return window.btoa(binary);
 }
+
+// ---------- Remote audio playback (phone / Tailscale clients) ----------
+// The hub broadcasts Ultron's voice as 24kHz PCM16; remote devices have no
+// path to the Mac's speakers, so schedule the chunks through Web Audio here.
+
+let playbackCtx = null;
+let playbackTime = 0;
+const activeSources = new Set();
+
+function ensurePlaybackCtx() {
+  if (!playbackCtx) {
+    playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (playbackCtx.state === "suspended") playbackCtx.resume();
+  return playbackCtx;
+}
+
+function playPcmChunk(b64) {
+  try {
+    const ctx = ensurePlaybackCtx();
+    const raw = window.atob(b64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const pcm = new Int16Array(bytes.buffer);
+    if (!pcm.length) return;
+
+    const f32 = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
+
+    const buf = ctx.createBuffer(1, f32.length, 24000);
+    buf.getChannelData(0).set(f32);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+
+    const now = ctx.currentTime;
+    if (playbackTime < now + 0.05) playbackTime = now + 0.05;
+    src.start(playbackTime);
+    playbackTime += buf.duration;
+    activeSources.add(src);
+    src.onended = () => activeSources.delete(src);
+  } catch (e) {
+    console.warn("PCM playback error:", e);
+  }
+}
+
+function flushPlayback() {
+  activeSources.forEach((s) => { try { s.stop(); } catch (_) {} });
+  activeSources.clear();
+  playbackTime = 0;
+}
+
+// Mobile browsers keep AudioContexts suspended until a user gesture; the
+// first tap unlocks both mic capture and voice playback.
+document.addEventListener("pointerdown", () => {
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+  if (playbackCtx && playbackCtx.state === "suspended") playbackCtx.resume();
+  if (IS_REMOTE && !micStream) initMicrophone();
+}, { passive: true });
+
+// ---------- Remote exec approval ----------
+
+const approvalOverlayEl = document.getElementById("exec-approval");
+const approvalCmdEl = document.getElementById("exec-approval-cmd");
+const approvalToolEl = document.getElementById("exec-approval-tool");
+let currentApprovalId = null;
+
+function showExecApproval(msg) {
+  currentApprovalId = msg.id;
+  approvalToolEl.textContent = msg.tool === "execute_applescript_task" ? "AppleScript" : "Shell command";
+  approvalCmdEl.textContent = msg.preview || "(empty)";
+  approvalOverlayEl.style.display = "flex";
+  if (navigator.vibrate) navigator.vibrate(120);
+}
+
+function closeExecApproval(id) {
+  if (id && id !== currentApprovalId) return;
+  currentApprovalId = null;
+  approvalOverlayEl.style.display = "none";
+}
+
+function respondExecApproval(approved) {
+  if (!currentApprovalId) return;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "exec_approval_response",
+      id: currentApprovalId,
+      approved: approved
+    }));
+  }
+  addChatMessage("System", (approved ? "Approved" : "Denied") + " remote command.", "system");
+  closeExecApproval(currentApprovalId);
+}
+
+document.getElementById("exec-approve").addEventListener("click", () => respondExecApproval(true));
+document.getElementById("exec-deny").addEventListener("click", () => respondExecApproval(false));
 
 // ---------- Controls ----------
 
