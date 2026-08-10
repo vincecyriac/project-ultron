@@ -514,6 +514,12 @@ window.SVE = {
   resetCamera() {
     if (activeSceneId) setActiveScene(activeSceneId);
   },
+  /** Force a resize pass — needed once after the viewport unhides from
+   * display:none, since ResizeObserver can settle mid-transition on some
+   * WebKit builds while the widget grid's row track is still resolving. */
+  forceResize() {
+    resize();
+  },
   registerInputSource(src) {
     // Gesture/XR extension point: src = {update(dt), dispose()} manipulating
     // the exported state below. See SVE.md "Gesture Integration Layer".

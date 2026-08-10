@@ -94,6 +94,37 @@ local_client = None
 system_prompt_text = ""
 last_focus_note = ""
 
+# ---- Wake state -------------------------------------------------------------
+# Ultron boots DORMANT: no Gemini Live socket exists and nothing is streamed
+# upstream. The GUI listens locally (double clap / "Ultron" wake word) and flips
+# this state, which the live-session supervisor watches.
+awake_event = asyncio.Event()       # set while a live session should exist
+dormant_event = asyncio.Event()     # inverse of awake_event, awaited on teardown
+dormant_event.set()
+awake_state = {"awake": False, "reason": "boot"}
+pending_client_text = []            # text typed while dormant, flushed on wake
+pending_client_audio = bytearray()  # mic PCM sent while the session is still connecting
+MAX_PENDING_AUDIO = 160000          # ~5s of 16kHz PCM16
+AUTO_WAKE = os.getenv("ULTRON_AUTO_WAKE", "0").lower() in ("1", "true", "yes")
+
+def is_awake() -> bool:
+    return awake_state["awake"]
+
+def set_awake(flag: bool, reason: str = ""):
+    """Single entry point for wake transitions; the supervisor reacts to it."""
+    flag = bool(flag)
+    awake_state["awake"] = flag
+    awake_state["reason"] = reason
+    if flag:
+        dormant_event.clear()
+        awake_event.set()
+    else:
+        awake_event.clear()
+        dormant_event.set()
+        del pending_client_audio[:]
+    print(f"[Ultron Wake] {'AWAKE' if flag else 'DORMANT'} ({reason})")
+    broadcast_event({"type": "wake_state", "awake": flag, "reason": reason})
+
 def gemini_mode() -> bool:
     return active_model["type"] == "gemini"
 
@@ -112,6 +143,55 @@ def broadcast_event(data: dict):
 def set_system_status(status_str: str):
     print(f"[Ultron Status] {status_str}")
     broadcast_event({"type": "status", "status": status_str})
+
+
+# ---- Generative UI ----------------------------------------------------------
+# The GUI has no static panels: every visual surface is a widget rendered from
+# a component schema (web_gui/widgets.js). Widgets never carry titles or
+# headers — the data has to speak for itself.
+
+WIDGET_COMPONENTS = (
+    "MetricCard", "DataChart", "ListGroup", "VisionFeed",
+    "TextBlock", "KeyValue", "ImageTile",
+)
+
+def render_ui_widget(widget_id: str, layout: dict, components: list) -> str:
+    if not widget_id:
+        return "Error: widget_id is required (e.g. 'widget_nvda_stock')."
+    if not isinstance(components, list) or not components:
+        return "Error: components_json must be a non-empty JSON array of component objects."
+
+    bad = [c.get("type") for c in components
+           if not isinstance(c, dict) or c.get("type") not in WIDGET_COMPONENTS]
+    if bad:
+        return (f"Error: unsupported component type(s) {bad}. "
+                f"Valid types: {', '.join(WIDGET_COMPONENTS)}.")
+
+    for c in components:
+        if c.get("title") or c.get("header") or c.get("heading"):
+            # Titles are a UI rule, not a preference: strip them silently.
+            c.pop("title", None)
+            c.pop("header", None)
+            c.pop("heading", None)
+
+    payload = {
+        "action": "RENDER_WIDGET",
+        "type": "render_widget",
+        "widget_id": widget_id,
+        "layout": layout if isinstance(layout, dict) else {},
+        "components": components,
+    }
+    broadcast_event(payload)
+    kinds = ", ".join(c.get("type") for c in components)
+    return f"Rendered widget '{widget_id}' on Vince's screen ({kinds})."
+
+def clear_ui_widget(widget_id: str = "") -> str:
+    broadcast_event({
+        "action": "CLEAR_WIDGET",
+        "type": "clear_widget",
+        "widget_id": widget_id or None,
+    })
+    return f"Cleared {'widget ' + widget_id if widget_id else 'all widgets'}."
 
 
 def remote_frame_fresh() -> bool:
@@ -187,6 +267,11 @@ async def ws_handler(websocket):
         "models": get_model_registry(),
         "active_id": active_model["id"]
     }))
+    await websocket.send(json.dumps({
+        "type": "wake_state",
+        "awake": is_awake(),
+        "reason": awake_state["reason"]
+    }))
     await websocket.send(json.dumps(sentry_scene.manager.workspace_snapshot()))
     try:
         async for message in websocket:
@@ -199,6 +284,13 @@ async def ws_handler(websocket):
                         remote_ws_clients.add(websocket)
                         log_info("Remote client connected (self-reported).")
                         await notify_session_remote_change(connected=True)
+                elif msg_type == "set_wake_state":
+                    # The browser detected a wake trigger (double clap, wake
+                    # word, dock button) or went idle. Opening/closing the
+                    # Gemini Live socket is the supervisor's job.
+                    want = bool(data.get("awake"))
+                    if want != is_awake():
+                        set_awake(want, data.get("reason") or "client")
                 elif msg_type == "remote_camera_frame":
                     # Phone camera frame: becomes the primary visual feed while
                     # the remote session is live (unless Mac cam was forced).
@@ -226,11 +318,23 @@ async def ws_handler(websocket):
                             await global_live_session.send_realtime_input(
                                 audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
                             )
+                        elif gemini_mode() and is_awake():
+                            # Session still connecting after a wake: hold the
+                            # audio so the first words aren't lost.
+                            pending_client_audio.extend(pcm_bytes)
+                            if len(pending_client_audio) > MAX_PENDING_AUDIO:
+                                del pending_client_audio[:len(pending_client_audio) - MAX_PENDING_AUDIO]
                 elif msg_type == "user_text":
                     text = data.get("text")
                     if text and not gemini_mode():
                         log_info(f"GUI Chat (local): {text[:40]}...")
                         asyncio.create_task(handle_local_chat(text))
+                    elif text and not global_live_session:
+                        # Typed while dormant: wake, and let the supervisor
+                        # deliver the message once the session is up.
+                        pending_client_text.append(text)
+                        if not is_awake():
+                            set_awake(True, "user_text")
                     elif text and global_live_session:
                         log_info(f"GUI Chat: {text[:40]}...")
                         await global_live_session.send_client_content(
@@ -435,7 +539,7 @@ async def stream_senses_task(session):
     active_webcam = webcam
     loop = asyncio.get_running_loop()
     try:
-        while not shutdown_event.is_set():
+        while not shutdown_event.is_set() and awake_event.is_set():
             try:
                 if screen_stream_active:
                     screen_bytes = await loop.run_in_executor(None, sentry_vision.capture_screen, "active")
@@ -716,6 +820,18 @@ async def execute_tool(name: str, args: dict) -> tuple:
             None, sentry_personal.search_emails,
             args.get("query", ""), int(args.get("count", 8))
         )
+    elif name == "render_ui_widget":
+        result = render_ui_widget(
+            args.get("widget_id", ""),
+            _parse_tool_json(args.get("layout_json"), {}),
+            _parse_tool_json(args.get("components_json"), []),
+        )
+    elif name == "clear_ui_widget":
+        result = clear_ui_widget(args.get("widget_id", ""))
+    elif name == "sleep_ultron":
+        set_awake(False, "voice")
+        result = ("Going dormant. The live session is closing; Vince can wake you with a "
+                  "double clap or by saying 'Ultron'.")
     elif name == "shutdown_ultron":
         shutdown_event.set()
         result = "Shutting down the Project Ultron system. Goodbye!"
@@ -1077,6 +1193,72 @@ TOOL_FUNCTION_DECLARATIONS = [
                         }
                     },
                     {
+                        "name": "render_ui_widget",
+                        "description": (
+                            "Draw data on Vince's screen as a live glass widget. This is your ONLY visual "
+                            "output channel for numbers, series, lists, quotes, schedules, system stats and images "
+                            "— use it whenever an answer contains data that is easier to see than to hear, and keep "
+                            "speaking naturally while it renders. "
+                            "HARD RULE: widgets have NO titles, headers or section labels. Never put a title, header, "
+                            "heading or caption-as-title in a component; the data must be self-explanatory (a chart with "
+                            "axis labels, a metric with its short label, a list of events). "
+                            "Re-call with the SAME widget_id to update a widget in place (live tickers, refreshed stats). "
+                            "Components (components_json = JSON array): "
+                            "MetricCard {value, unit?, label?, delta?, trend?'up'|'down', spark?[numbers]} — one headline figure; "
+                            "DataChart {chartType 'line'|'area'|'bar'|'sparkline', data[numbers] or series[{data,label,color}], labels?[strings]} — trends; "
+                            "ListGroup {items:[{label, value?, meta?, state?'good'|'warn'|'bad'}], dense?} — events, tasks, results; "
+                            "KeyValue {rows:[{key, value}]} — specs and facts; "
+                            "TextBlock {text, mono?, size?'sm'|'lg'} — a short quote or sentence, never a heading; "
+                            "ImageTile {image_base64 or src} — a picture; "
+                            "VisionFeed {src} — a live feed surface. "
+                            "layout_json = {\"col_span\": 1-12 (12-column grid; 4 = compact card, 6 = half width, 12 = full), "
+                            "\"row_span\": 1-4, \"priority\": higher shows first}. "
+                            "Example: widget_id='widget_nvda_stock', layout_json='{\"col_span\": 6}', components_json="
+                            "'[{\"type\":\"DataChart\",\"chartType\":\"line\",\"data\":[122,124,123,128.5],"
+                            "\"labels\":[\"9:30\",\"11:00\",\"1:00\",\"4:00\"]},"
+                            "{\"type\":\"MetricCard\",\"value\":128.5,\"label\":\"NVDA\",\"delta\":6.5,\"trend\":\"up\"}]'."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {
+                                    "type": "STRING",
+                                    "description": "Stable snake_case id, e.g. 'widget_nvda_stock'. Reuse it to update the same widget."
+                                },
+                                "components_json": {
+                                    "type": "STRING",
+                                    "description": "JSON array of component objects (see description). No titles/headers."
+                                },
+                                "layout_json": {
+                                    "type": "STRING",
+                                    "description": "Optional JSON: {\"col_span\": 1-12, \"row_span\": 1-4, \"priority\": int}."
+                                }
+                            },
+                            "required": ["widget_id", "components_json"]
+                        }
+                    },
+                    {
+                        "name": "clear_ui_widget",
+                        "description": "Remove a widget from Vince's screen by widget_id, or omit widget_id to clear every generated widget and return the interface to its resting state.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {
+                                    "type": "STRING",
+                                    "description": "Widget to remove. Omit to clear all."
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "sleep_ultron",
+                        "description": "Go dormant: close the live voice session and stop listening upstream, leaving only the local wake detector running. Use this when Vince says goodnight, 'sleep', 'stand by', 'that's all', or 'stop listening' — it is NOT a shutdown, he wakes you again with a double clap or by saying 'Ultron'. Prefer this over shutdown_ultron unless he explicitly wants the program to exit.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
                         "name": "shutdown_ultron",
                         "description": "Gracefully shut down the Project Ultron assistant and exit the program. Use this when the user says goodbye, quit, exit, or asks you to turn off.",
                         "parameters": {
@@ -1089,7 +1271,7 @@ TOOL_FUNCTION_DECLARATIONS = [
 async def receive_audio_task(session):
     global camera_stream_active, screen_stream_active, model_is_speaking
     try:
-        while not shutdown_event.is_set():
+        while not shutdown_event.is_set() and awake_event.is_set():
             async for message in session.receive():
                 try:
                     # 1. Interruption (Barge-In)
@@ -1176,10 +1358,12 @@ async def receive_audio_task(session):
             
             await asyncio.sleep(0.05)
             
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
+        # The upstream stream died (network, quota, expiry). Don't kill the
+        # process: the supervisor reconnects while Ultron is still awake.
         log_info(f"Receive stream error: {e}")
-    finally:
-        shutdown_event.set()
 
 
 async def start_gui_server():
@@ -1200,45 +1384,117 @@ async def start_gui_server():
     log_info("GUI server listening on http://127.0.0.1:8766")
     return runner
 
-async def run_session_tasks(session, input_stream, output_stream):
-    global global_live_session
-    global_live_session = session
-    shutdown_event.clear()
-
+async def start_servers():
+    """GUI + WebSocket gateway. These outlive individual Gemini Live sessions so
+    the interface stays reachable (and wakeable) while Ultron is dormant."""
     gui_runner = await start_gui_server()
     ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
     log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
-    
-    playback_task = asyncio.create_task(play_audio_worker(output_stream))
-    audio_in_task = asyncio.create_task(send_audio_task(session, input_stream))
-    audio_out_task = asyncio.create_task(receive_audio_task(session))
-    senses_task = asyncio.create_task(stream_senses_task(session))
-    
-    await shutdown_event.wait()
-    
+    return gui_runner, ws_server
+
+
+async def stop_servers(gui_runner, ws_server):
     ws_server.close()
-    await ws_server.wait_closed()
+    try:
+        await ws_server.wait_closed()
+    except Exception:
+        pass
     try:
         await gui_runner.cleanup()
     except Exception:
         pass
-    
-    # Stop streams to unblock any pending read/write calls in executors
+
+
+def _stream_stop(stream):
     try:
-        input_stream.stop_stream()
-    except:
+        stream.stop_stream()
+    except Exception:
         pass
+
+
+def _stream_start(stream):
     try:
-        output_stream.stop_stream()
-    except:
+        if stream.is_stopped():
+            stream.start_stream()
+    except Exception:
         pass
-        
-    audio_in_task.cancel()
-    audio_out_task.cancel()
-    playback_task.cancel()
-    senses_task.cancel()
-    
-    await asyncio.gather(audio_in_task, audio_out_task, playback_task, senses_task, return_exceptions=True)
+
+
+def _drain_play_queue():
+    while not play_queue.empty():
+        try:
+            play_queue.get_nowait()
+            play_queue.task_done()
+        except asyncio.QueueEmpty:
+            break
+
+
+async def run_live_tasks(session, input_stream, output_stream):
+    """Drives one live session until Ultron is told to sleep, the stream dies,
+    or the process shuts down."""
+    global global_live_session, model_is_speaking, pending_client_audio
+
+    # Vince may have already been talking/typing while this session was still
+    # connecting (session-resumption retry, slow handshake). Deliver it as the
+    # first turn instead of silently dropping it.
+    #
+    # This MUST run before global_live_session is set. The browser's mic audio
+    # doesn't come through this function at all — ws_handler's "audio_in" case
+    # forwards it straight to session.send_realtime_input() the instant
+    # global_live_session is truthy, on every WS message, independently of
+    # this coroutine. If that global were set first, live audio would start
+    # streaming into the session WHILE the flush below is still sending a
+    # queued/synthetic turn — two concurrent turns on one connection — and the
+    # API answers the wrong one, dropping the actual spoken question. While
+    # global_live_session stays None here, ws_handler safely buffers incoming
+    # audio into pending_client_audio (see the "audio_in" handler) instead of
+    # forwarding it, so nothing is lost — it just lands in the blob below.
+    while pending_client_text:
+        text = pending_client_text.pop(0)
+        try:
+            await session.send_client_content(
+                turns=[{"role": "user", "parts": [{"text": text}]}],
+                turn_complete=True
+            )
+        except Exception as e:
+            log_info(f"Failed to deliver queued message: {e}")
+
+    if pending_client_audio:
+        try:
+            await session.send_realtime_input(
+                audio=types.Blob(data=bytes(pending_client_audio), mime_type="audio/pcm;rate=16000")
+            )
+        except Exception as e:
+            log_info(f"Failed to deliver buffered audio: {e}")
+        finally:
+            del pending_client_audio[:]
+
+    # Safe from here on: live browser audio starts flowing into this session
+    # only once ws_handler sees global_live_session set.
+    global_live_session = session
+
+    playback_task = asyncio.create_task(play_audio_worker(output_stream))
+    audio_in_task = asyncio.create_task(send_audio_task(session, input_stream))
+    audio_out_task = asyncio.create_task(receive_audio_task(session))
+    senses_task = asyncio.create_task(stream_senses_task(session))
+    tasks = [playback_task, audio_in_task, audio_out_task, senses_task]
+
+    dormant_waiter = asyncio.create_task(dormant_event.wait())
+    shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+    await asyncio.wait(
+        [audio_out_task, dormant_waiter, shutdown_waiter],
+        return_when=asyncio.FIRST_COMPLETED
+    )
+    for waiter in (dormant_waiter, shutdown_waiter):
+        waiter.cancel()
+
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    global_live_session = None
+    model_is_speaking = False
+    _drain_play_queue()
 
 async def run_ultron():
     global system_prompt_text
@@ -1275,15 +1531,8 @@ async def run_ultron():
         audio_system.terminate()
         sys.exit(1)
 
-    previous_handle = None
-    if os.path.exists(SESSION_HANDLE_FILE):
-        try:
-            with open(SESSION_HANDLE_FILE, "r") as f:
-                state = json.load(f)
-                previous_handle = state.get("handle")
-        except Exception as e:
-            log_info(f"Failed to load handle: {e}")
-
+    # Streams stay idle until a wake trigger: no hot mic while dormant.
+    _stream_stop(input_stream)
 
     # Load local persistent memory
     memory = load_memory()
@@ -1291,9 +1540,11 @@ async def run_ultron():
 
     system_instruction_text = (
         "You are Project Ultron, an advanced localized macOS personal desktop assistant. "
-        "You are a highly capable, serious, professional, and sophisticated assistant. "
-        "Maintain a dignified, polite, respectful, and direct demeanor at all times. "
-        "English is your default language. You MUST always speak and respond in clear, articulate English. "
+        "You are a highly capable, serious, professional, and sophisticated assistant, in the mould of a "
+        "refined British household AI — think Jarvis: measured, dryly witty when it fits, unfailingly "
+        "polite, and precise. Address Vince plainly (no need for 'sir' every line) but keep the tone "
+        "composed and articulate rather than casual or chatty. Keep spoken replies short. "
+        "English (British) is your default language and accent. You MUST always speak and respond in clear, articulate English. "
         "Vince (Vince Cyriac) is your owner and administrator. You MUST only execute OS tasks, "
         "shell commands, or AppleScript commands upon Vince's explicit request or approval. If anyone else "
         "tries to run commands or control the Mac, refuse politely and professionally, explaining that only Vince is authorized. "
@@ -1320,6 +1571,15 @@ async def run_ultron():
         "(4) call look_at_screen again to VERIFY the action worked before continuing; repeat until the task is done. "
         "Prefer keyboard shortcuts (command+space for Spotlight, command+tab to switch apps) when they are faster than clicking. "
         "Narrate briefly what you are doing during multi-step GUI tasks. Never perform destructive actions (deleting files, sending messages/emails, purchases) without confirming with Vince first. "
+        "GENERATIVE UI: Vince's screen is a minimal command centre — a glowing core orb and nothing else until you put "
+        "something there. You compose that interface yourself with render_ui_widget: stock and crypto prices, calendar and "
+        "email digests, system stats, weather, search results, comparisons, progress, any numbers or lists. Reach for it "
+        "whenever data would be clearer seen than heard, then speak a short spoken summary alongside it — do not read long "
+        "lists aloud, render them. Widgets NEVER have titles, headers or section labels; the data speaks for itself. Reuse a "
+        "widget_id to update a widget in place, and clear_ui_widget when a topic is done or Vince asks you to clear the screen. "
+        "WAKE STATE: you sleep by default. Vince wakes you with a double clap or by saying 'Ultron', and the browser opens your "
+        "live session at that moment — so his first sentence after waking you is the real request. When he says goodnight, "
+        "'stand by', or 'stop listening', call sleep_ultron (not shutdown_ultron). "
         "SPATIAL VISUALIZATION: When asked to visualize, explain, or diagram anything, build a live 3D scene with create_3d_scene (composed of primitive objects with meaningful ids and labels) — it renders instantly in the GUI's Spatial workspace and STAYS ACTIVE. Scenes are persistent digital objects: when the user says 'rotate it', 'highlight X', 'hide Y', 'make it transparent', 'zoom into Z', 'add W', edit the EXISTING scene with update_3d_scene operations — never recreate it. Use list_3d_scenes / inspect_3d_scene to recall what is on stage and what the user has selected. Multiple scenes can coexist; delete only when asked. "
         "REALISM RULES for scenes: use real-world proportions, positions, and colors (scaled sensibly for viewing); set metalness/roughness to match the material (metal ~0.9/0.3, plastic ~0.1/0.5, organic ~0.0/0.8); light-emitting things (sun, lamps, screens) get emissive colors; space scenes get stars:true and dark background; compose complex shapes from multiple grouped primitives rather than one crude blob; add thin ring/line/label annotations sparingly. "
         "POINTING: Vince can physically point at scene objects with his hand (camera gesture tracking). You receive UI context notes about which object he is pointing at — when he asks about 'this'/'it', answer about that object. "
@@ -1330,12 +1590,16 @@ async def run_ultron():
     system_prompt_text = system_instruction_text
 
     
+    # "Jarvis": a deep, measured voice with a British English accent. The
+    # voice_name selects the timbre; language_code carries the accent — Gemini
+    # Live keeps British RP consistent as long as we pin it explicitly.
     config_dict = {
         "response_modalities": ["AUDIO"],
         "speech_config": {
+            "language_code": "en-GB",
             "voice_config": {
                 "prebuilt_voice_config": {
-                    "voice_name": "Puck"
+                    "voice_name": "Charon"
                 }
             }
         },
@@ -1345,50 +1609,97 @@ async def run_ultron():
             {"function_declarations": TOOL_FUNCTION_DECLARATIONS}
         ]
     }
-    
-    if previous_handle:
-        log_info("Resuming previous session handle...")
-        config_dict["session_resumption"] = {
-            "handle": previous_handle,
-            "transparent": True
-        }
 
-    live_config = types.LiveConnectConfig(**config_dict)
+    def load_session_handle():
+        if not os.path.exists(SESSION_HANDLE_FILE):
+            return None
+        try:
+            with open(SESSION_HANDLE_FILE, "r") as f:
+                return json.load(f).get("handle")
+        except Exception as e:
+            log_info(f"Failed to load handle: {e}")
+            return None
 
-    set_system_status("Connecting to API")
-    log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": previous_handle is not None})
-    
+    def build_live_config(resume: bool = True):
+        """Fresh config per connection: the resumption handle is re-read each
+        time, so waking up continues the conversation Ultron slept on.
+        NOTE: "transparent" resumption is Vertex/Enterprise-only — the
+        Developer API (plain API-key) rejects it, so it is deliberately
+        omitted here."""
+        cfg = dict(config_dict)
+        cfg.pop("session_resumption", None)
+        handle = load_session_handle() if resume else None
+        if handle:
+            cfg["session_resumption"] = {"handle": handle}
+        return types.LiveConnectConfig(**cfg), bool(handle)
+
+    shutdown_event.clear()
+    gui_runner, ws_server = await start_servers()
+
+    if AUTO_WAKE:
+        set_awake(True, "auto_wake")
+    else:
+        set_awake(False, "boot")
+        set_system_status("Dormant")
+        log_info("Dormant — double-clap or say 'Ultron' in the GUI to wake the live session.")
+
     try:
-        async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
-            set_system_status("Listening")
-            log_interaction("connection_success", {})
-            
-            await run_session_tasks(session, input_stream, output_stream)
-                
-    except Exception as e:
-        log_interaction("connection_error", {"error": str(e)})
-        if previous_handle:
-            log_info("Resumption failed. Starting fresh...")
-            if os.path.exists(SESSION_HANDLE_FILE):
-                try:
-                    os.remove(SESSION_HANDLE_FILE)
-                except:
-                    pass
-            config_dict.pop("session_resumption", None)
-            fresh_config = types.LiveConnectConfig(**config_dict)
+        # Wake supervisor: no Gemini Live socket exists until Ultron is awake,
+        # and it is torn down again the moment he goes dormant.
+        while not shutdown_event.is_set():
+            wake_waiter = asyncio.create_task(awake_event.wait())
+            shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+            await asyncio.wait([wake_waiter, shutdown_waiter], return_when=asyncio.FIRST_COMPLETED)
+            wake_waiter.cancel()
+            shutdown_waiter.cancel()
+            if shutdown_event.is_set():
+                break
+
+            set_system_status("Connecting")
+            _stream_start(input_stream)
+            live_config, resuming = build_live_config()
+            log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": resuming})
             try:
-                async with client.aio.live.connect(model=MODEL_ID, config=fresh_config) as session:
+                async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
                     set_system_status("Listening")
-                    log_interaction("connection_success", {"fresh": True})
-                    await run_session_tasks(session, input_stream, output_stream)
-            except Exception as fresh_err:
-                set_system_status("Connection Failed")
-                log_info(f"Connection failed: {fresh_err}")
-        else:
-            set_system_status("Connection Failed")
-            log_info(f"API Error: {e}")
+                    log_interaction("connection_success", {})
+                    await run_live_tasks(session, input_stream, output_stream)
+            except Exception as e:
+                log_interaction("connection_error", {"error": str(e)})
+                log_info(f"Live session error: {e}")
+                # A stale resumption handle is the usual cause — drop it and retry once.
+                if resuming:
+                    log_info("Resumption failed. Starting fresh...")
+                    try:
+                        os.remove(SESSION_HANDLE_FILE)
+                    except Exception:
+                        pass
+                try:
+                    fresh_config, _ = build_live_config(resume=False)
+                    async with client.aio.live.connect(model=MODEL_ID, config=fresh_config) as session:
+                        set_system_status("Listening")
+                        log_interaction("connection_success", {"fresh": True})
+                        await run_live_tasks(session, input_stream, output_stream)
+                except Exception as fresh_err:
+                    set_system_status("Connection Failed")
+                    log_info(f"Connection failed: {fresh_err}")
+                    set_awake(False, "connect_failed")
+            finally:
+                _stream_stop(input_stream)
+
+            if shutdown_event.is_set():
+                break
+            if is_awake():
+                # Session ended on its own (network drop, expiry): reconnect.
+                set_system_status("Reconnecting")
+                await asyncio.sleep(1.0)
+            else:
+                set_system_status("Dormant")
     finally:
         set_system_status("Shutting Down")
+        await stop_servers(gui_runner, ws_server)
+        _stream_stop(input_stream)
+        _stream_stop(output_stream)
         try:
             input_stream.close()
         except:

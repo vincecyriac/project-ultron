@@ -10,6 +10,26 @@ Run:
 # GUI: http://127.0.0.1:8766
 ```
 
+## Wake state
+
+Ultron boots **dormant**: no Gemini Live session exists and no audio leaves the
+browser. The GUI listens locally (Web Audio) for a **double clap** or the wake
+word **"Ultron"** (also: dock mic button, click the orb, or just start typing).
+Waking plays a metallic chime, opens the live session, and spins the Brain Core
+up. Sleep again with Esc, holding the mic button, or telling Ultron to
+"stand by" (`sleep_ultron` tool). Idle sessions auto-sleep after 3 minutes.
+`ULTRON_AUTO_WAKE=1` restores the old always-on behaviour.
+
+## GUI
+
+Single-stage command centre — no tabs, no panels, no labels. State is the orb's
+colour/motion (steel = dormant, cyan = listening, amber = thinking, violet =
+speaking, red = error). Content renders as title-free glass widgets: the model
+composes them via `render_ui_widget` (MetricCard / DataChart / ListGroup /
+KeyValue / TextBlock / ImageTile / VisionFeed) and clears them with
+`clear_ui_widget`. Camera, screen and 3D (SVE) feeds appear as widgets when
+live; transcript and tool activity fade in as widgets and expire on their own.
+
 ## Remote access (phone / other devices)
 
 Ultron is reachable from your phone over your private Tailscale network —
