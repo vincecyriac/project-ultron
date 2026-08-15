@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Ultron — Personal Assistant</title>
+  <title>Ultron</title>
   <link rel="stylesheet" href="style.css" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12,146 +12,41 @@
 <body>
   <div class="app">
 
-    <!-- Header -->
-    <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark" id="brand-mark"></div>
-        <span class="brand-name">Ultron</span>
-      </div>
+    <!-- Hero Stage: Holds the 3D Orb. Starts centered, moves top-left when displaced -->
+    <div id="hero-stage" class="hero-stage">
+      <canvas id="visualizer-canvas"></canvas>
+    </div>
 
-      <div class="status-chip" id="system-status">
-        <span class="status-dot"></span>
-        <span id="status-text">Connecting…</span>
-      </div>
+    <!-- Widget Stage: Dynamic Title-Free Components -->
+    <div id="widgetStage" class="widget-stage"></div>
 
-      <select id="model-select" class="model-select" title="Active model">
-        <option>Loading models…</option>
-      </select>
+    <!-- Action Dock: Bottom Right -->
+    <div class="action-dock">
+      <button class="dock-btn active" id="btn-mic" title="Microphone">
+        <span class="icon">🎙️</span>
+      </button>
+      <button class="dock-btn" id="btn-cam" title="Camera">
+        <span class="icon">📷</span>
+      </button>
+      <button class="dock-btn" id="btn-screen" title="Screen Share">
+        <span class="icon">🖥️</span>
+      </button>
+      <button class="dock-btn" id="btn-fullscreen" title="Fullscreen">
+        <span class="icon">⛶</span>
+      </button>
+    </div>
 
-      <div class="sense-chips">
-        <div class="chip active" id="sense-mic" title="Microphone">
-          <span class="chip-dot"></span><span class="sense-text">Mic</span>
-        </div>
-        <div class="chip" id="sense-cam" title="Camera">
-          <span class="chip-dot"></span><span class="sense-text">Camera</span>
-        </div>
-        <div class="chip" id="sense-screen" title="Screen">
-          <span class="chip-dot"></span><span class="sense-text">Screen</span>
-        </div>
-      </div>
-    </header>
+    <!-- Hidden feeds required for legacy bindings/functionality -->
+    <div id="hidden-feeds" style="display: none;">
+      <video id="webcam-video" autoplay playsinline muted></video>
+      <img id="webcam-img" />
+      <canvas id="cam-overlay"></canvas>
+      <img id="screen-img" />
+    </div>
 
-    <!-- Main -->
-    <main class="layout">
-
-      <!-- Sidebar -->
-      <aside class="sidebar">
-        <div class="card core-card">
-          <canvas id="visualizer-canvas" width="360" height="120"></canvas>
-          <div class="core-state" id="audio-state-tag">Idle</div>
-        </div>
-
-        <div class="card controls-card">
-          <button class="ctl active" id="btn-mic">
-            <span class="ctl-icon">🎙</span><span class="btn-lbl">Mic on</span>
-          </button>
-          <button class="ctl" id="btn-cam">
-            <span class="ctl-icon">📷</span><span class="btn-lbl">Camera</span>
-          </button>
-          <button class="ctl" id="btn-screen">
-            <span class="ctl-icon">🖥</span><span class="btn-lbl">Screen</span>
-          </button>
-          <button class="ctl stop" id="btn-interrupt">
-            <span class="ctl-icon">■</span><span class="btn-lbl">Stop</span>
-          </button>
-        </div>
-
-        <div class="card feed-card" id="cam-feed-card" style="display:none;">
-          <div class="feed-head">
-            <div class="feed-label" id="cam-feed-label">Camera</div>
-            <button class="ghost-btn" id="btn-cam-flip" style="display:none;" title="Switch front/rear camera">🔄 Flip</button>
-          </div>
-          <div class="feed-body">
-            <video id="webcam-video" autoplay playsinline muted style="display:none;"></video>
-            <img id="webcam-img" style="display:none;" />
-            <canvas id="cam-overlay"></canvas>
-            <span class="feed-off" id="cam-placeholder">Off</span>
-          </div>
-        </div>
-
-        <div class="card feed-card" id="screen-feed-card" style="display:none;">
-          <div class="feed-label">Screen</div>
-          <div class="feed-body">
-            <img id="screen-img" style="display:none;" />
-            <span class="feed-off" id="screen-placeholder">Off</span>
-          </div>
-        </div>
-      </aside>
-
-      <!-- Content -->
-      <section class="content card">
-        <nav class="tabs">
-          <button class="tab active" id="tab-chat-btn" onclick="switchTab('chat')">Chat</button>
-          <button class="tab" id="tab-vis-btn" onclick="switchTab('vis')">
-            Spatial<span class="tab-badge" id="vis-badge"></span>
-          </button>
-          <button class="tab" id="tab-act-btn" onclick="switchTab('act')">
-            Activity<span class="tab-badge" id="act-badge"></span>
-          </button>
-        </nav>
-
-        <!-- Chat -->
-        <div class="tab-view active" id="tab-chat">
-          <div class="chat-scroll" id="chat-messages">
-            <div class="chat-welcome">
-              <p>Hi Vince — talk to me over the mic, or type below.</p>
-            </div>
-          </div>
-          <div class="chat-inputbar">
-            <input type="text" id="chat-input" placeholder="Message Ultron…" autocomplete="off" />
-            <button id="send-btn" title="Send">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="22" y1="2" x2="11" y2="13"></line>
-                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        <!-- Spatial workspace (SVE) -->
-        <div class="tab-view" id="tab-vis">
-          <div class="vis-toolbar">
-            <div class="sve-scene-tabs" id="sve-scene-tabs"></div>
-            <div class="vis-actions">
-              <button class="ghost-btn" id="btn-hands" title="Hand gesture control (webcam)">✋ Hands</button>
-              <button class="ghost-btn" onclick="window.SVE && SVE.resetCamera()">Reset view</button>
-            </div>
-          </div>
-          <div class="sve-stage">
-            <div id="sve-viewport"></div>
-            <div class="gesture-cursor" id="gesture-cursor"></div>
-            <div class="gesture-hud" id="gesture-hud"></div>
-            <div class="sve-info" id="sve-info"></div>
-            <div class="empty-state" id="sve-empty">
-              <p>Ask Ultron to visualize anything — scenes render here as live 3D objects.
-              Drag to orbit, scroll to zoom, click objects to select, F to focus, Del to remove.</p>
-            </div>
-          </div>
-        </div>
-
-        <!-- Activity -->
-        <div class="tab-view" id="tab-act">
-          <div class="activity-feed" id="activity-feed">
-            <div class="empty-state" id="activity-empty">
-              <p>Every action — commands, clicks, web fetches, recognitions — shows up here live.</p>
-            </div>
-          </div>
-        </div>
-      </section>
-    </main>
   </div>
 
-  <!-- Remote command approval (shown when a Tailscale session asks to run shell/AppleScript) -->
+  <!-- Remote command approval -->
   <div class="exec-approval" id="exec-approval" style="display:none;">
     <div class="exec-approval-box">
       <div class="exec-approval-title">⚠ Command approval required</div>
@@ -167,8 +62,19 @@
   <script type="importmap">
     { "imports": { "three": "./vendor/three.module.min.js" } }
   </script>
+  
+  <!-- The new engine modules will be imported within app.js, or directly here -->
+  <script type="module">
+    import { WakeEngine } from './wake_engine.js';
+    import { GUIEngine } from './gui_engine.js';
+    
+    // Make engines available globally for app.js integration
+    window.WakeEngine = WakeEngine;
+    window.GUIEngine = GUIEngine;
+  </script>
+  
   <script type="module" src="sve.js"></script>
   <script type="module" src="gestures.js"></script>
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>
