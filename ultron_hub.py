@@ -42,9 +42,10 @@ try:
 except AttributeError:
     pass
 
-SESSION_HANDLE_FILE = ".session_handle.json"
-HISTORY_LOG_FILE = "ultron_history.jsonl"
-MEMORY_FILE = "ultron_memory.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSION_HANDLE_FILE = os.path.join(BASE_DIR, ".session_handle.json")
+HISTORY_LOG_FILE = os.path.join(BASE_DIR, "ultron_history.jsonl")
+MEMORY_FILE = os.path.join(BASE_DIR, "ultron_memory.json")
 
 # Model selection: defaults to gemini-3.1-flash-live-preview, customizable via env
 MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
@@ -399,10 +400,10 @@ async def play_audio_worker(output_stream):
             log_info(f"Playback error: {e}")
             await asyncio.sleep(0.1)
 
-async def send_audio_task(session, input_stream):
+async def send_audio_task(session, input_stream, session_disconnect_event):
     global mic_audio_buffer, model_is_speaking
     loop = asyncio.get_running_loop()
-    while True:
+    while not shutdown_event.is_set() and not session_disconnect_event.is_set():
         try:
             data = await loop.run_in_executor(
                 None,
@@ -425,17 +426,18 @@ async def send_audio_task(session, input_stream):
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log_info(f"Error reading mic: {e}")
+            if not session_disconnect_event.is_set() and not shutdown_event.is_set():
+                log_info(f"Error reading mic: {e}")
             await asyncio.sleep(0.1)
 
-async def stream_senses_task(session):
+async def stream_senses_task(session, session_disconnect_event):
     """Continuously captures and streams the user's screen and webcam frames to the Live session in the background when enabled by the AI."""
     global active_webcam, latest_webcam_frame_bytes
     webcam = sentry_vision.PersistentWebcam()
     active_webcam = webcam
     loop = asyncio.get_running_loop()
     try:
-        while not shutdown_event.is_set():
+        while not shutdown_event.is_set() and not session_disconnect_event.is_set():
             try:
                 if screen_stream_active:
                     screen_bytes = await loop.run_in_executor(None, sentry_vision.capture_screen, "active")
@@ -476,7 +478,8 @@ async def stream_senses_task(session):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log_interaction("sense_stream_error", {"error": str(e)})
+                if not session_disconnect_event.is_set() and not shutdown_event.is_set():
+                    log_interaction("sense_stream_error", {"error": str(e)})
                 await asyncio.sleep(2.0)
     finally:
         webcam.stop()
@@ -1086,104 +1089,114 @@ TOOL_FUNCTION_DECLARATIONS = [
                     }
 ]
 
-async def receive_audio_task(session):
+async def receive_audio_task(session, session_disconnect_event):
     global camera_stream_active, screen_stream_active, model_is_speaking
     try:
-        while not shutdown_event.is_set():
-            async for message in session.receive():
-                try:
-                    # 1. Interruption (Barge-In)
-                    if message.server_content and message.server_content.interrupted:
-                        set_system_status("Listening (Interrupted)")
-                        interrupted_event.set()
-                        model_is_speaking = False
-                        while not play_queue.empty():
-                            try:
-                                play_queue.get_nowait()
-                                play_queue.task_done()
-                            except asyncio.QueueEmpty:
-                                break
-                        await asyncio.sleep(0.05)
-                        interrupted_event.clear()
-                        broadcast_event({"type": "interrupted"})
-                        log_interaction("user_interruption", {})
-                        continue
+        async for message in session.receive():
+            if shutdown_event.is_set() or session_disconnect_event.is_set():
+                break
+            try:
+                # 0. Handle GoAway Signal (proactive session rotation before 1008 timeout)
+                if message.go_away:
+                    time_left = getattr(message.go_away, "time_left", None)
+                    log_info(f"Received GoAway from Gemini API (time left: {time_left}). Gracefully closing to rotate/resume session...")
+                    session_disconnect_event.set()
+                    return
 
-                    # 2. Audio Output
-                    if message.server_content and message.server_content.model_turn:
-                        for part in message.server_content.model_turn.parts:
-                            if part.inline_data:
-                                set_system_status("Speaking")
-                                audio_data = part.inline_data.data
-                                await play_queue.put(audio_data)
-                                pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
-                                broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
-                            if part.text:
-                                broadcast_event({"type": "chat_log", "sender": "Ultron", "text": part.text, "style": "ultron"})
+                # 1. Interruption (Barge-In)
+                if message.server_content and message.server_content.interrupted:
+                    set_system_status("Listening (Interrupted)")
+                    interrupted_event.set()
+                    model_is_speaking = False
+                    while not play_queue.empty():
+                        try:
+                            play_queue.get_nowait()
+                            play_queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+                    await asyncio.sleep(0.05)
+                    interrupted_event.clear()
+                    broadcast_event({"type": "interrupted"})
+                    log_interaction("user_interruption", {})
+                    continue
 
-                    # Reset status to Listening when turn finishes
-                    if message.server_content and message.server_content.turn_complete:
-                        set_system_status("Listening")
+                # 2. Audio Output
+                if message.server_content and message.server_content.model_turn:
+                    for part in message.server_content.model_turn.parts:
+                        if part.inline_data:
+                            set_system_status("Speaking")
+                            audio_data = part.inline_data.data
+                            await play_queue.put(audio_data)
+                            pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
+                            broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
+                        if part.text:
+                            broadcast_event({"type": "chat_log", "sender": "Ultron", "text": part.text, "style": "ultron"})
 
-                    # 3. Handle Session Resumption (Silent log)
-                    if message.session_resumption_update:
-                        update = message.session_resumption_update
-                        if update.resumable and update.new_handle:
+                # Reset status to Listening when turn finishes
+                if message.server_content and message.server_content.turn_complete:
+                    set_system_status("Listening")
+
+                # 3. Handle Session Resumption (Silent log)
+                if message.session_resumption_update:
+                    update = message.session_resumption_update
+                    if update.resumable and update.new_handle:
+                        try:
                             with open(SESSION_HANDLE_FILE, "w") as f:
                                 json.dump({"handle": update.new_handle}, f)
                             log_interaction("session_resumption_update", {"handle_preview": update.new_handle[:15]})
+                        except Exception as err:
+                            log_info(f"Failed to write session handle: {err}")
 
-                    # 4. Handle OS Execution Tool Calls
-                    if message.tool_call:
-                        function_responses = []
-                        for fc in message.tool_call.function_calls:
-                            set_system_status(f"Executing {fc.name}")
-                            log_info(f"Tool call: {fc.name}")
-                            broadcast_event({
-                                "type": "tool_activity",
-                                "phase": "start",
-                                "name": fc.name,
-                                "args_preview": json.dumps(dict(fc.args or {}))[:220]
-                            })
-                            log_interaction("tool_call_received", {"name": fc.name, "args": fc.args})
-                            
-                            result, tool_image = await execute_tool(fc.name, dict(fc.args or {}))
-                            if tool_image:
-                                await session.send_realtime_input(
-                                    video=types.Blob(data=tool_image, mime_type="image/jpeg")
-                                )
-
-                            log_info(f"Result: {str(result)[:50]}...")
-                            broadcast_event({
-                                "type": "tool_activity",
-                                "phase": "done",
-                                "name": fc.name,
-                                "result_preview": str(result)[:300]
-                            })
-                            log_interaction("tool_call_executed", {"name": fc.name, "output_preview": str(result)[:100]})
-                            
-                            function_responses.append(types.FunctionResponse(
-                                id=fc.id,
-                                name=fc.name,
-                                response={"output": result}
-                            ))
+                # 4. Handle OS Execution Tool Calls
+                if message.tool_call:
+                    function_responses = []
+                    for fc in message.tool_call.function_calls:
+                        set_system_status(f"Executing {fc.name}")
+                        log_info(f"Tool call: {fc.name}")
+                        broadcast_event({
+                            "type": "tool_activity",
+                            "phase": "start",
+                            "name": fc.name,
+                            "args_preview": json.dumps(dict(fc.args or {}))[:220]
+                        })
+                        log_interaction("tool_call_received", {"name": fc.name, "args": fc.args})
                         
-                        await session.send_tool_response(function_responses=function_responses)
+                        result, tool_image = await execute_tool(fc.name, dict(fc.args or {}))
+                        if tool_image:
+                            await session.send_realtime_input(
+                                video=types.Blob(data=tool_image, mime_type="image/jpeg")
+                            )
 
+                        log_info(f"Result: {str(result)[:50]}...")
+                        broadcast_event({
+                            "type": "tool_activity",
+                            "phase": "done",
+                            "name": fc.name,
+                            "result_preview": str(result)[:300]
+                        })
+                        log_interaction("tool_call_executed", {"name": fc.name, "output_preview": str(result)[:100]})
                         
-                except Exception as e:
-                    log_info(f"Error in receive message: {e}")
-            
-            await asyncio.sleep(0.05)
+                        function_responses.append(types.FunctionResponse(
+                            id=fc.id,
+                            name=fc.name,
+                            response={"output": result}
+                        ))
+                    
+                    await session.send_tool_response(function_responses=function_responses)
+
+            except Exception as e:
+                log_info(f"Error in receive message: {e}")
             
     except Exception as e:
-        log_info(f"Receive stream error: {e}")
+        if not shutdown_event.is_set():
+            log_info(f"Receive stream error / ended: {e}")
     finally:
-        shutdown_event.set()
+        session_disconnect_event.set()
 
 
 async def start_gui_server():
     """Serves web_gui over HTTP so ES modules (Three.js) load reliably."""
+    # pyrefly: ignore [missing-import]
     from aiohttp import web
     gui_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_gui")
 
@@ -1200,45 +1213,32 @@ async def start_gui_server():
     log_info("GUI server listening on http://127.0.0.1:8766")
     return runner
 
-async def run_session_tasks(session, input_stream, output_stream):
+async def run_session_tasks(session, input_stream):
     global global_live_session
     global_live_session = session
-    shutdown_event.clear()
+    session_disconnect_event = asyncio.Event()
 
-    gui_runner = await start_gui_server()
-    ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
-    log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
-    
-    playback_task = asyncio.create_task(play_audio_worker(output_stream))
-    audio_in_task = asyncio.create_task(send_audio_task(session, input_stream))
-    audio_out_task = asyncio.create_task(receive_audio_task(session))
-    senses_task = asyncio.create_task(stream_senses_task(session))
-    
-    await shutdown_event.wait()
-    
-    ws_server.close()
-    await ws_server.wait_closed()
+    audio_in_task = asyncio.create_task(send_audio_task(session, input_stream, session_disconnect_event))
+    audio_out_task = asyncio.create_task(receive_audio_task(session, session_disconnect_event))
+    senses_task = asyncio.create_task(stream_senses_task(session, session_disconnect_event))
+
+    shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+    disconnect_waiter = asyncio.create_task(session_disconnect_event.wait())
+
     try:
-        await gui_runner.cleanup()
-    except Exception:
-        pass
-    
-    # Stop streams to unblock any pending read/write calls in executors
-    try:
-        input_stream.stop_stream()
-    except:
-        pass
-    try:
-        output_stream.stop_stream()
-    except:
-        pass
-        
-    audio_in_task.cancel()
-    audio_out_task.cancel()
-    playback_task.cancel()
-    senses_task.cancel()
-    
-    await asyncio.gather(audio_in_task, audio_out_task, playback_task, senses_task, return_exceptions=True)
+        done, pending = await asyncio.wait(
+            [shutdown_waiter, disconnect_waiter],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for p in pending:
+            p.cancel()
+    finally:
+        session_disconnect_event.set()
+        audio_in_task.cancel()
+        audio_out_task.cancel()
+        senses_task.cancel()
+        await asyncio.gather(audio_in_task, audio_out_task, senses_task, return_exceptions=True)
+        global_live_session = None
 
 async def run_ultron():
     global system_prompt_text
@@ -1275,15 +1275,11 @@ async def run_ultron():
         audio_system.terminate()
         sys.exit(1)
 
-    previous_handle = None
-    if os.path.exists(SESSION_HANDLE_FILE):
-        try:
-            with open(SESSION_HANDLE_FILE, "r") as f:
-                state = json.load(f)
-                previous_handle = state.get("handle")
-        except Exception as e:
-            log_info(f"Failed to load handle: {e}")
-
+    # Start background servers & audio worker (persist across Gemini Live session reconnections)
+    gui_runner = await start_gui_server()
+    ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
+    log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
+    playback_task = asyncio.create_task(play_audio_worker(output_stream))
 
     # Load local persistent memory
     memory = load_memory()
@@ -1329,73 +1325,94 @@ async def run_ultron():
     )
     system_prompt_text = system_instruction_text
 
-    
-    config_dict = {
-        "response_modalities": ["AUDIO"],
-        "speech_config": {
-            "voice_config": {
-                "prebuilt_voice_config": {
-                    "voice_name": "Puck"
-                }
-            }
-        },
-        "system_instruction": {"parts": [{"text": system_instruction_text}]},
-        "tools": [
-            {"google_search": {}},
-            {"function_declarations": TOOL_FUNCTION_DECLARATIONS}
-        ]
-    }
-    
-    if previous_handle:
-        log_info("Resuming previous session handle...")
-        config_dict["session_resumption"] = {
-            "handle": previous_handle,
-            "transparent": True
-        }
-
-    live_config = types.LiveConnectConfig(**config_dict)
-
-    set_system_status("Connecting to API")
-    log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": previous_handle is not None})
-    
+    consecutive_failures = 0
     try:
-        async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
-            set_system_status("Listening")
-            log_interaction("connection_success", {})
-            
-            await run_session_tasks(session, input_stream, output_stream)
-                
-    except Exception as e:
-        log_interaction("connection_error", {"error": str(e)})
-        if previous_handle:
-            log_info("Resumption failed. Starting fresh...")
+        while not shutdown_event.is_set():
+            previous_handle = None
             if os.path.exists(SESSION_HANDLE_FILE):
                 try:
-                    os.remove(SESSION_HANDLE_FILE)
-                except:
-                    pass
-            config_dict.pop("session_resumption", None)
-            fresh_config = types.LiveConnectConfig(**config_dict)
+                    with open(SESSION_HANDLE_FILE, "r") as f:
+                        state = json.load(f)
+                        previous_handle = state.get("handle")
+                except Exception as e:
+                    log_info(f"Failed to load handle: {e}")
+
+            config_dict = {
+                "response_modalities": ["AUDIO"],
+                "speech_config": {
+                    "voice_config": {
+                        "prebuilt_voice_config": {
+                            "voice_name": "Puck"
+                        }
+                    }
+                },
+                "system_instruction": {"parts": [{"text": system_instruction_text}]},
+                "tools": [
+                    {"google_search": {}},
+                    {"function_declarations": TOOL_FUNCTION_DECLARATIONS}
+                ]
+            }
+            
+            if previous_handle:
+                log_info("Resuming previous session handle...")
+                config_dict["session_resumption"] = {
+                    "handle": previous_handle,
+                    "transparent": True
+                }
+
+            live_config = types.LiveConnectConfig(**config_dict)
+
+            set_system_status("Connecting to API" if not previous_handle else "Resuming API Session")
+            log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": previous_handle is not None})
+            
             try:
-                async with client.aio.live.connect(model=MODEL_ID, config=fresh_config) as session:
+                async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
                     set_system_status("Listening")
-                    log_interaction("connection_success", {"fresh": True})
-                    await run_session_tasks(session, input_stream, output_stream)
-            except Exception as fresh_err:
-                set_system_status("Connection Failed")
-                log_info(f"Connection failed: {fresh_err}")
-        else:
-            set_system_status("Connection Failed")
-            log_info(f"API Error: {e}")
+                    log_interaction("connection_success", {"resumed": previous_handle is not None})
+                    consecutive_failures = 0
+                    
+                    await run_session_tasks(session, input_stream)
+                        
+            except Exception as e:
+                consecutive_failures += 1
+                log_interaction("connection_error", {"error": str(e)})
+                if previous_handle:
+                    log_info(f"Session resumption failed ({e}). Clearing handle and starting fresh...")
+                    if os.path.exists(SESSION_HANDLE_FILE):
+                        try:
+                            os.remove(SESSION_HANDLE_FILE)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.5)
+                else:
+                    set_system_status("Connection Failed")
+                    log_info(f"Live API error: {e}")
+                    backoff = min(10, 2 ** min(consecutive_failures, 3))
+                    log_info(f"Retrying connection in {backoff}s...")
+                    await asyncio.sleep(backoff)
+
+            if not shutdown_event.is_set():
+                log_info("Gemini Live session ended. Rotating / resuming session...")
+                await asyncio.sleep(0.2)
+
     finally:
         set_system_status("Shutting Down")
+        ws_server.close()
+        await ws_server.wait_closed()
         try:
+            await gui_runner.cleanup()
+        except Exception:
+            pass
+        playback_task.cancel()
+        try:
+            input_stream.stop_stream()
             input_stream.close()
-        except:
+        except Exception:
             pass
         try:
+            output_stream.stop_stream()
             output_stream.close()
-        except:
+        except Exception:
             pass
         audio_system.terminate()
         print("Project Ultron engine terminated. Goodbye.")

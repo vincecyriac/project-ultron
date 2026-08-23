@@ -3,7 +3,7 @@ import os
 from google import genai
 from dotenv import load_dotenv
 
-load_dotenv('project_ultron/.env')
+load_dotenv()
 
 async def main():
     client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
