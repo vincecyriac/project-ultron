@@ -83,6 +83,9 @@
     </div>
   </div>
 
+  <!-- Screen Sentinel: ghost hint pill, docked above the widget deck -->
+  <div class="sentinel-lane" id="sentinel-lane"></div>
+
   <!-- Ultra-minimal sensor dock -->
   <div class="dock">
     <button class="dock-btn active" id="btn-mic" title="Microphone" aria-pressed="true">
@@ -98,6 +101,14 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
         <path d="M22 8.5v7a1 1 0 0 1-1.55.83L16 13.5v-3l4.45-2.83A1 1 0 0 1 22 8.5z"></path>
         <rect x="2" y="6" width="14" height="12" rx="2.5"></rect>
+      </svg>
+      <span class="dock-slash"></span>
+    </button>
+
+    <button class="dock-btn" id="btn-sentinel" title="Screen Sentinel — watch and proofread" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3l7 3v5c0 4.2-2.9 7.9-7 9-4.1-1.1-7-4.8-7-9V6z"></path>
+        <circle cx="12" cy="11" r="2.4"></circle>
       </svg>
       <span class="dock-slash"></span>
     </button>

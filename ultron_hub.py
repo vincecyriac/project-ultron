@@ -36,6 +36,8 @@ import sentry_recognition
 import sentry_web
 import sentry_personal
 import sentry_scene
+import sentinel_ax
+import sentinel_vision
 import ultron_agents
 
 # Load environment variables
@@ -325,6 +327,7 @@ async def ws_handler(websocket):
         await websocket.send(json.dumps(telemetry))
     await websocket.send(json.dumps(sentry_scene.manager.workspace_snapshot()))
     await websocket.send(json.dumps(widget_snapshot()))
+    await websocket.send(json.dumps(sentinel_status()))
     try:
         async for message in websocket:
             try:
@@ -392,6 +395,13 @@ async def ws_handler(websocket):
                                 )
                             except Exception:
                                 pass
+                elif msg_type == "sentinel_toggle":
+                    result = (start_screen_sentinel() if data.get("active")
+                              else stop_screen_sentinel())
+                    log_info(f"GUI sentinel toggle: {result}")
+                elif msg_type == "sentinel_dismiss":
+                    # Let the same text be re-examined if he keeps working on it.
+                    sentinel_state["last_hint_at"] = time.time()
                 elif msg_type == "widget_user_action":
                     # The user clicked a card's X, or the GUI mounted the 3D
                     # card itself. Keep the hub's deck in step, and let the
@@ -677,6 +687,144 @@ async def _run_background_agent(tier: str, goal: str):
         "name": f"agent:{tier}", "result_preview": outcome[:300],
     })
     await deliver_agent_result(spec["label"], outcome)
+
+
+# ---------- Ambient Screen Sentinel ----------
+# Watches the focused text field (accessibility tree first, cropped window
+# capture only as a fallback) and speaks up when it sees something a good pair
+# would mention. Off by default: this reads whatever Vince is typing, so it is
+# started explicitly, never silently.
+
+SENTINEL_POLL_S = 0.25         # accessibility polling cadence
+SENTINEL_VISION_S = 1.5        # frame-diff cadence when AX gives us nothing
+SENTINEL_DEBOUNCE_S = 1.8      # pause in typing before an inspection fires
+SENTINEL_COOLDOWN_S = 12.0     # minimum gap between two hints
+# Apps where the visual context matters (attachment chips, recipient row), so
+# the window image goes along with the text rather than instead of it.
+SENTINEL_VISUAL_APPS = ("mail", "outlook", "spark", "superhuman", "thunderbird", "messages")
+
+sentinel_state = {
+    "running": False,
+    "task": None,
+    "last_hint_at": 0.0,
+    "last_hint": None,
+    "hint_text": None,
+    "reason": "",
+}
+
+
+def sentinel_status() -> dict:
+    return {"type": "sentinel_state", "running": sentinel_state["running"],
+            "reason": sentinel_state["reason"]}
+
+
+async def sentinel_loop():
+    """Poll, debounce, evaluate, and nudge. Never raises out of the loop."""
+    loop = asyncio.get_running_loop()
+    typing = sentinel_ax.TypingWatcher(debounce=SENTINEL_DEBOUNCE_S)
+    frames = sentinel_vision.FrameWatcher()
+    last_vision = 0.0
+
+    while sentinel_state["running"] and not shutdown_event.is_set():
+        try:
+            await asyncio.sleep(SENTINEL_POLL_S)
+            if time.time() - sentinel_state["last_hint_at"] < SENTINEL_COOLDOWN_S:
+                continue
+
+            snapshot = await loop.run_in_executor(None, sentinel_ax.read_focus)
+
+            # A hint is on screen and he has carried on typing: he has seen it
+            # and moved past it, so let the GUI retire the pill.
+            if sentinel_state["last_hint"] is not None:
+                current = snapshot.get("text")
+                if current is not None and current != sentinel_state.get("hint_text"):
+                    sentinel_state["last_hint"] = None
+                    broadcast_event({"type": "sentinel_typing"})
+
+            settled = typing.poll(snapshot)
+
+            text = image = None
+            app_name = snapshot.get("app", "?")
+            title = snapshot.get("title")
+
+            if settled:
+                text = settled.get("text")
+                if any(k in app_name.lower() for k in SENTINEL_VISUAL_APPS):
+                    img, _ = await loop.run_in_executor(None, sentinel_vision.capture_active_window)
+                    image = await loop.run_in_executor(None, sentinel_vision.encode_jpeg, img)
+            else:
+                # No readable text: fall back to watching the window itself.
+                if snapshot.get("text") is not None:
+                    continue
+                if time.time() - last_vision < SENTINEL_VISION_S:
+                    continue
+                last_vision = time.time()
+                img, win = await loop.run_in_executor(None, frames.poll)
+                if img is None:
+                    continue
+                image = await loop.run_in_executor(None, sentinel_vision.encode_jpeg, img)
+                app_name = win.get("app", app_name)
+                title = win.get("title") or title
+
+            if not text and not image:
+                continue
+
+            hint = await ultron_agents.evaluate_workspace(
+                genai_client, app_name=app_name, text=text, image_jpeg=image, title=title)
+            if not hint:
+                continue
+
+            sentinel_state["last_hint_at"] = time.time()
+            sentinel_state["last_hint"] = hint
+            sentinel_state["hint_text"] = text
+            log_info(f"[sentinel] {hint['issue_type']}: {hint['spoken_nudge']}")
+            broadcast_event({
+                "type": "sentinel_hint",
+                "app_name": hint.get("app_name", app_name),
+                "issue_type": hint.get("issue_type"),
+                "spoken_nudge": hint.get("spoken_nudge", ""),
+                "original_snippet": hint.get("original_snippet", ""),
+                "suggested_snippet": hint.get("suggested_snippet", ""),
+                "explanation": hint.get("explanation", ""),
+            })
+            # Spoken through the same quiet-gap queue as agent results, so a
+            # nudge can never cut Ultron off mid-sentence.
+            pending_agent_results.append(("screen sentinel", hint["spoken_nudge"]))
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_info(f"[sentinel] loop error: {e}")
+            await asyncio.sleep(1.0)
+
+
+def start_screen_sentinel() -> str:
+    if sentinel_state["running"]:
+        return "The screen sentinel is already watching."
+    if not sentinel_ax.is_trusted():
+        sentinel_state["reason"] = "Accessibility permission is not granted."
+        broadcast_event(sentinel_status())
+        return ("I need Accessibility permission first: System Settings > Privacy & Security > "
+                "Accessibility, enable Ultron, then ask me again.")
+    sentinel_state["running"] = True
+    sentinel_state["reason"] = ""
+    sentinel_state["task"] = asyncio.create_task(sentinel_loop())
+    broadcast_event(sentinel_status())
+    log_info("[sentinel] watching the workspace.")
+    return "Screen sentinel is watching. Tell Vince it is on, in a few words."
+
+
+def stop_screen_sentinel() -> str:
+    if not sentinel_state["running"]:
+        return "The screen sentinel was not running."
+    sentinel_state["running"] = False
+    task = sentinel_state.pop("task", None)
+    sentinel_state["task"] = None
+    if task:
+        task.cancel()
+    broadcast_event(sentinel_status())
+    log_info("[sentinel] stopped.")
+    return "Screen sentinel stopped."
 
 
 # ---------- Widget deck ----------
@@ -1074,6 +1222,10 @@ async def execute_tool(name: str, args: dict) -> tuple:
             None, sentry_personal.search_emails,
             args.get("query", ""), int(args.get("count", 8))
         )
+    elif name == "start_screen_sentinel":
+        result = start_screen_sentinel()
+    elif name == "stop_screen_sentinel":
+        result = stop_screen_sentinel()
     elif name == "create_widget":
         result = await create_widget(args.get("widget_id", ""), args.get("title", ""),
                                      args.get("components"), args.get("widget_type", ""))
@@ -1449,6 +1601,21 @@ TOOL_FUNCTION_DECLARATIONS = [
                         }
                     },
                     {
+                        "name": "start_screen_sentinel",
+                        "description": (
+                            "Start watching Vince's workspace and quietly flag typos, syntax "
+                            "errors and missed context as he types. Use when he asks you to "
+                            "watch over his shoulder, proofread as he writes, or pair with him. "
+                            "It reads whatever he is typing, so only start it when he asks."
+                        ),
+                        "parameters": {"type": "OBJECT", "properties": {}}
+                    },
+                    {
+                        "name": "stop_screen_sentinel",
+                        "description": "Stop watching the workspace. Use when he asks for privacy or says to stop.",
+                        "parameters": {"type": "OBJECT", "properties": {}}
+                    },
+                    {
                         "name": "create_widget",
                         "description": (
                             "Mount a data-dense card on the GUI deck. Use this for ANY answer "
@@ -1801,6 +1968,11 @@ def build_system_instruction(memory_str: str) -> str:
         "POINTING: Vince can point at scene objects by hand. You receive UI context notes naming "
         "the object — when he says 'this' or 'it', he means that one. "
 
+        "SCREEN SENTINEL: start_screen_sentinel makes you watch his workspace and flag typos, "
+        "broken syntax and missed context as he writes; stop_screen_sentinel ends it. Start it "
+        "only when he asks you to watch, proofread or pair with him — it reads what he types, so "
+        "it is never something you switch on unprompted. When a nudge fires you will be handed "
+        "the wording; say it and nothing more. "
         "If Vince says goodbye, quit or exit, invoke shutdown_ultron. "
         "Remember: under 10 words spoken, always. The widgets do the talking."
     )
@@ -1947,6 +2119,7 @@ async def run_ultron():
 
     finally:
         set_system_status("Shutting Down")
+        sentinel_state["running"] = False
 
         # 1. Stop everything that could still touch an audio device, and WAIT
         #    for it — cancelling without awaiting used to race PyAudio teardown

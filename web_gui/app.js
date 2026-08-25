@@ -51,6 +51,8 @@ const screenPlaceholder = document.getElementById("screen-placeholder");
 const screenFeedCard = document.getElementById("screen-feed-card");
 const pipStackEl = document.querySelector(".pip-stack");
 const agentRailEl = document.getElementById("agent-rail");
+const sentinelLaneEl = document.getElementById("sentinel-lane");
+const btnSentinel = document.getElementById("btn-sentinel");
 const widgetDeckEl = document.getElementById("widget-deck");
 const sveStageEl = document.getElementById("sve-stage");
 const sveParkingEl = document.getElementById("sve-parking");
@@ -297,6 +299,7 @@ function initWebSocket() {
     backendSpeaking = false;
     activeTools = 0;
     clearAudioSchedule();
+    setSentinelState(false, "Disconnected");
     scheduleAgentChipClear();
     setTimeout(initWebSocket, 3000);
   };
@@ -377,6 +380,18 @@ function handleServerMessage(msg) {
       applyTelemetry(msg);
       break;
 
+    case "sentinel_hint":
+      showSentinelHint(msg);
+      break;
+
+    case "sentinel_typing":
+      sentinelTypingResumed();
+      break;
+
+    case "sentinel_state":
+      setSentinelState(msg.running, msg.reason);
+      break;
+
     case "widget_action":
       switch (msg.action) {
         case "sync":
@@ -421,6 +436,94 @@ function updateStatus(status) {
     clearAudioSchedule();
   }
 }
+
+// ---------- Screen Sentinel ----------
+// One hint at a time, docked above the deck. It auto-dismisses once Vince has
+// clearly moved on, so an ignored nudge never becomes clutter.
+
+const SENTINEL_DISMISS_MS = 8000;
+let sentinelTimer = null;
+let sentinelHint = null;
+
+function showSentinelHint(msg) {
+  clearTimeout(sentinelTimer);
+  sentinelHint = msg;
+  sentinelLaneEl.innerHTML = "";
+
+  const card = document.createElement("div");
+  card.className = `sentinel-hint ${esc(msg.issue_type || "")}`;
+  card.innerHTML =
+    '<div class="sh-head">'
+    + `<span class="sh-kind">${esc(msg.issue_type || "hint")}</span>`
+    + `<span class="sh-app">${esc(msg.app_name || "")}</span>`
+    + '<button class="sh-x" title="Ignore">&times;</button>'
+    + '</div>'
+    + `<div class="sh-nudge">${esc(msg.spoken_nudge || "")}</div>`
+    + (msg.original_snippet
+        ? '<div class="sh-diff">'
+          + `<div class="sh-line del">${esc(msg.original_snippet)}</div>`
+          + `<div class="sh-line add">${esc(msg.suggested_snippet || "")}</div></div>`
+        : "")
+    + (msg.explanation ? `<div class="sh-why">${esc(msg.explanation)}</div>` : "")
+    + '<div class="sh-actions"><button class="sh-btn ignore">Dismiss</button></div>';
+
+  sentinelLaneEl.appendChild(card);
+
+  const close = () => dismissSentinelHint(true);
+  card.querySelector(".sh-x").addEventListener("click", close);
+  card.querySelector(".sh-btn.ignore").addEventListener("click", close);
+
+  // No blind timer: the pill stays while he is reading it, and retires 8s after
+  // he carries on typing (the hub tells us when that happens). The long stop is
+  // only a backstop for a lost connection.
+  clearTimeout(sentinelTimer);
+  sentinelTimer = setTimeout(close, SENTINEL_DISMISS_MS * 8);
+  reserveSentinelSpace();
+}
+
+/** Push the deck down so a hint never covers the first card. */
+function reserveSentinelSpace() {
+  const card = sentinelLaneEl.firstElementChild;
+  const h = card ? Math.round(card.getBoundingClientRect().height) : 0;
+  document.documentElement.style.setProperty("--sentinel-h", h ? `${h + 12}px` : "0px");
+  document.body.classList.toggle("sentinel-visible", !!card);
+  pumpRenderers(200);
+}
+
+/** He resumed typing: he has seen it, so start the 8s retirement. */
+function sentinelTypingResumed() {
+  if (!sentinelLaneEl.firstElementChild) return;
+  clearTimeout(sentinelTimer);
+  sentinelTimer = setTimeout(() => dismissSentinelHint(false), SENTINEL_DISMISS_MS);
+}
+
+function dismissSentinelHint(tellHub) {
+  clearTimeout(sentinelTimer);
+  const card = sentinelLaneEl.firstElementChild;
+  if (card) {
+    card.classList.add("leaving");
+    setTimeout(() => card.remove(), 250);
+  }
+  if (tellHub && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "sentinel_dismiss" }));
+  }
+  sentinelHint = null;
+  setTimeout(reserveSentinelSpace, 260);
+}
+
+function setSentinelState(running, reason) {
+  setDockState(btnSentinel, !!running);
+  btnSentinel.title = running
+    ? "Screen Sentinel — watching"
+    : (reason || "Screen Sentinel — watch and proofread");
+}
+
+btnSentinel.addEventListener("click", () => {
+  const turningOn = !btnSentinel.classList.contains("active");
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "sentinel_toggle", active: turningOn }));
+  }
+});
 
 // ---------- Widget deck ----------
 // The hub drives this by voice: create / update / dismiss / clear_all. The
