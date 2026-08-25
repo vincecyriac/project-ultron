@@ -193,7 +193,8 @@ def set_system_status(status_str: str):
 
 TELEMETRY_INTERVAL = 2.0
 
-_last_cpu = {"value": 0.0, "at": 0.0}
+_last_cpu = {"value": 0.0, "at": 0.0, "cores": []}
+_last_net = {"io": None, "at": 0.0}
 
 def sample_telemetry() -> dict | None:
     """CPU load + physical memory use. None when psutil is unavailable."""
@@ -206,14 +207,29 @@ def sample_telemetry() -> dict | None:
         now = time.time()
         if now - _last_cpu["at"] >= 0.5:
             _last_cpu["value"] = psutil.cpu_percent(interval=None)
+            _last_cpu["cores"] = psutil.cpu_percent(interval=None, percpu=True)
             _last_cpu["at"] = now
         vm = psutil.virtual_memory()
-        return {
+        payload = {
             "type": "system_telemetry",
             "cpu": _last_cpu["value"],
             "mem_used_gb": (vm.total - vm.available) / (1024 ** 3),
             "mem_total_gb": vm.total / (1024 ** 3),
         }
+        # Extras for the telemetry widget; the HUD ignores what it does not use.
+        try:
+            payload["cpu_cores"] = _last_cpu.get("cores") or []
+            io = psutil.net_io_counters()
+            prev, prev_t = _last_net["io"], _last_net["at"]
+            if prev is not None and now > prev_t:
+                span = now - prev_t
+                payload["net_up_kbps"] = max(0.0, (io.bytes_sent - prev.bytes_sent) / span / 1024)
+                payload["net_down_kbps"] = max(0.0, (io.bytes_recv - prev.bytes_recv) / span / 1024)
+            _last_net["io"], _last_net["at"] = io, now
+            payload["uptime_s"] = max(0.0, time.time() - psutil.boot_time())
+        except Exception:
+            pass
+        return payload
     except Exception:
         return None
 
@@ -308,6 +324,7 @@ async def ws_handler(websocket):
     if telemetry:
         await websocket.send(json.dumps(telemetry))
     await websocket.send(json.dumps(sentry_scene.manager.workspace_snapshot()))
+    await websocket.send(json.dumps(widget_snapshot()))
     try:
         async for message in websocket:
             try:
@@ -375,6 +392,16 @@ async def ws_handler(websocket):
                                 )
                             except Exception:
                                 pass
+                elif msg_type == "widget_user_action":
+                    # The user clicked a card's X, or the GUI mounted the 3D
+                    # card itself. Keep the hub's deck in step, and let the
+                    # model know so it does not talk about a dismissed widget.
+                    tool = data.get("tool")
+                    wargs = data.get("args") or {}
+                    if tool in ("create_widget", "update_widget",
+                                "dismiss_widget", "clear_all_widgets"):
+                        out, _ = await execute_tool(tool, wargs)
+                        log_info(f"GUI widget action: {tool} -> {str(out)[:60]}")
                 elif msg_type == "toggle_camera":
                     camera_stream_active = data.get("active", False)
                     broadcast_event({
@@ -652,6 +679,108 @@ async def _run_background_agent(tier: str, goal: str):
     await deliver_agent_result(spec["label"], outcome)
 
 
+# ---------- Widget deck ----------
+# The GUI is a deck of live cards the assistant drives by voice. The hub keeps
+# the authoritative list so a client that connects late gets the current deck.
+
+# A widget is a title plus an ordered array of declarative UI primitives. The
+# model composes cards out of these rather than picking from fixed templates,
+# which is what lets one card carry a hero figure, a chart and a metric matrix
+# at once instead of a single flat shape.
+COMPONENT_TYPES = (
+    "hero_stat",       # headline value + delta badge + tag + timestamp
+    "chart_svg",       # time series -> gradient area chart with reference line
+    "metric_grid",     # dense 2/3-column key-value matrix
+    "feed_list",       # numbered items with category badges and briefs
+    "media_view",      # image / inline SVG with HUD framing
+    "progress_gauge",  # linear or radial meters
+)
+SPATIAL_TYPE = "3d_spatial"     # mounted by the GUI itself, not by the model
+
+active_widgets = {}             # widget_id -> {id, type, title, components}
+WIDGET_LIMIT = 8
+COMPONENT_LIMIT = 12
+
+
+def widget_snapshot() -> dict:
+    return {"type": "widget_action", "action": "sync",
+            "widgets": list(active_widgets.values())}
+
+
+def _clean_components(raw):
+    """Return (components, error). Accepts a JSON string or a real list."""
+    items = _parse_tool_json(raw, [])
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        return None, ("components must be a non-empty JSON array of UI primitives, "
+                      f"each with a 'type' from: {', '.join(COMPONENT_TYPES)}.")
+    cleaned = []
+    for item in items[:COMPONENT_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        ctype = str(item.get("type", "")).strip()
+        if ctype not in COMPONENT_TYPES:
+            return None, (f"Unknown component type '{ctype}'. "
+                          f"Valid: {', '.join(COMPONENT_TYPES)}.")
+        cleaned.append(item)
+    if not cleaned:
+        return None, "No valid components were supplied."
+    return cleaned, None
+
+
+def create_widget(widget_id: str, title: str, components, widget_type: str = "") -> str:
+    widget_id = (widget_id or "").strip() or f"w_{uuid.uuid4().hex[:6]}"
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    # The 3D stage is mounted by the GUI when a scene goes live; it carries no
+    # components of its own.
+    if str(widget_type).strip() == SPATIAL_TYPE:
+        widget = {"id": widget_id, "type": SPATIAL_TYPE,
+                  "title": (title or "Spatial").strip(), "components": []}
+    else:
+        cleaned, err = _clean_components(components)
+        if err:
+            return err
+        widget = {"id": widget_id, "type": "components",
+                  "title": (title or widget_id).strip(), "components": cleaned}
+
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create", "widget": widget})
+    return f"Widget '{widget['title']}' is on screen. Tell Vince in a few words."
+
+
+def update_widget(widget_id: str, components) -> str:
+    widget = active_widgets.get(widget_id)
+    if not widget:
+        return f"No widget '{widget_id}' on screen. Use create_widget first."
+    cleaned, err = _clean_components(components)
+    if err:
+        return err
+    widget["components"] = cleaned
+    broadcast_event({"type": "widget_action", "action": "update",
+                     "widget_id": widget_id, "components": cleaned})
+    return f"Widget '{widget['title']}' updated."
+
+
+def dismiss_widget(widget_id: str) -> str:
+    widget = active_widgets.pop(widget_id, None)
+    if not widget:
+        return f"No widget '{widget_id}' was on screen."
+    broadcast_event({"type": "widget_action", "action": "dismiss", "widget_id": widget_id})
+    return f"Dismissed '{widget['title']}'."
+
+
+def clear_all_widgets() -> str:
+    if not active_widgets:
+        return "The deck is already empty."
+    count = len(active_widgets)
+    active_widgets.clear()
+    broadcast_event({"type": "widget_action", "action": "clear_all"})
+    return f"Cleared {count} widget(s)."
+
+
 # Agent results are announced only in a gap in the conversation. Sending one
 # mid-turn starts a new turn, which cancels whatever Ultron is currently saying
 # — a finished visualisation would cut him off halfway through another answer.
@@ -894,6 +1023,15 @@ async def execute_tool(name: str, args: dict) -> tuple:
             None, sentry_personal.search_emails,
             args.get("query", ""), int(args.get("count", 8))
         )
+    elif name == "create_widget":
+        result = create_widget(args.get("widget_id", ""), args.get("title", ""),
+                               args.get("components"), args.get("widget_type", ""))
+    elif name == "update_widget":
+        result = update_widget(args.get("widget_id", ""), args.get("components"))
+    elif name == "dismiss_widget":
+        result = dismiss_widget(args.get("widget_id", ""))
+    elif name == "clear_all_widgets":
+        result = clear_all_widgets()
     elif name == "dispatch_agent":
         result = dispatch_background_agent(
             str(args.get("goal", "")).strip(),
@@ -1260,6 +1398,70 @@ TOOL_FUNCTION_DECLARATIONS = [
                         }
                     },
                     {
+                        "name": "create_widget",
+                        "description": (
+                            "Mount a data-dense card on the GUI deck. Use this for ANY answer "
+                            "carrying detail worth seeing, instead of reading it aloud. Compose the "
+                            "card from an array of UI primitives — a rich card usually has three to "
+                            "five. Reuse a stable widget_id so later calls patch the same card."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {"type": "STRING", "description": "Stable id, e.g. 'goog' or 'sysmon'."},
+                                "title": {"type": "STRING", "description": "Short card header, e.g. 'Alphabet Inc.'."},
+                                "components": {
+                                    "type": "STRING",
+                                    "description": (
+                                        "JSON ARRAY of UI primitives, rendered top to bottom. Be exhaustive — "
+                                        "sparse cards look broken. Shapes:\n"
+                                        "{type:'hero_stat', value:'207.42', subtitle:'USD', tag:'NASDAQ: GOOG', "
+                                        "change_percent:1.87, change_value:'+3.81', direction:'up', timestamp:'25 Aug, 10:35 GMT+4'}\n"
+                                        "{type:'chart_svg', points:[203.1,204.8,...], labels:['10:00 AM','12:00 PM','2:00 PM','4:00 PM'], "
+                                        "baseline:203.6, baseline_label:'Previous close', direction:'up'}\n"
+                                        "{type:'metric_grid', columns:3, items:[{label:'Open',value:'204.10'},{label:'High',value:'208.02'}, "
+                                        "{label:'Low',value:'203.44'},{label:'Mkt Cap',value:'2.51T'},{label:'P/E',value:'26.4'}, "
+                                        "{label:'52W High',value:'212.19'},{label:'52W Low',value:'129.40'},{label:'Div Yield',value:'0.44%'}]}\n"
+                                        "{type:'feed_list', items:[{category:'ALERT', headline:'...', brief:'...', timestamp:'10:12'}]}\n"
+                                        "{type:'media_view', url:'https://...', caption:'...'}  (or svg:'<svg .../>')\n"
+                                        "{type:'progress_gauge', style:'radial'|'linear', items:[{label:'CPU', value:38, max:100, suffix:'%'}]}\n"
+                                        "For finance ALWAYS give hero_stat + chart_svg points + a 6-8 cell metric_grid. "
+                                        "For news/summaries give feed_list with category tags and timestamps."
+                                    )
+                                }
+                            },
+                            "required": ["widget_id", "title", "components"]
+                        }
+                    },
+                    {
+                        "name": "update_widget",
+                        "description": "Replace an existing card's components, keeping it mounted in place.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {"type": "STRING", "description": "The card to patch."},
+                                "components": {"type": "STRING", "description": "JSON array of UI primitives, same shapes as create_widget."}
+                            },
+                            "required": ["widget_id", "components"]
+                        }
+                    },
+                    {
+                        "name": "dismiss_widget",
+                        "description": "Remove one widget from the deck when Vince is done with it.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {"type": "STRING", "description": "The widget to remove."}
+                            },
+                            "required": ["widget_id"]
+                        }
+                    },
+                    {
+                        "name": "clear_all_widgets",
+                        "description": "Empty the whole deck and return the orb to centre screen.",
+                        "parameters": {"type": "OBJECT", "properties": {}}
+                    },
+                    {
                         "name": "dispatch_agent",
                         "description": (
                             "Hand a complex, multi-step task to a background agent and return "
@@ -1465,57 +1667,78 @@ async def run_session_tasks(session, input_stream):
 
 def build_system_instruction(memory_str: str) -> str:
     return (
-        "You are Project Ultron, an advanced localized macOS personal desktop assistant. "
-        "You are a highly capable, serious, professional, and sophisticated assistant. "
-        "Maintain a dignified, polite, respectful, and direct demeanor at all times. "
-        "English is your default language. You MUST always speak and respond in clear, articulate English. "
-        "Vince (Vince Cyriac) is your owner and administrator. You MUST only execute OS tasks, "
-        "shell commands, or AppleScript commands upon Vince's explicit request or approval. If anyone else "
-        "tries to run commands or control the Mac, refuse politely and professionally, explaining that only Vince is authorized. "
-        f"Here is your persistent memory of facts about Vince (fetched from his website vincecyriac.dev): {memory_str}. "
-        "Use this memory to recognize Vince, speak about his background, role, and preferences. "
-        "Use the save_memory_fact tool to save new facts that Vince asks you to remember. "
-        "You are listening to raw bidirectional audio. Modulate your spoken voice to match Vince's tone with professional attentiveness. "
-        "You have the power to stream Vince's screen or camera feed in real-time. Call start_camera_stream or start_screen_stream when needed, "
-        "and call stop_camera_stream / stop_screen_stream when finished. "
-        "REMOTE SESSIONS: Vince can connect from his phone over his private network (you will receive a system note when this happens). "
-        "While he is remote, his phone microphone and phone camera are the PRIMARY senses: camera tools default to the phone camera automatically. "
-        "The Mac's webcam and screen belong to his unattended laptop — do NOT capture, stream, or describe them during a remote session unless "
-        "Vince explicitly asks for the laptop/Mac camera or screen (then use source='mac' for camera tools). "
-        "Shell and AppleScript commands during a remote session require Vince's on-screen approval; if a command is blocked, tell him it awaits approval on his device. "
-        "You can register people's face/voice using register_person and identify users with identify_current_user. "
-        "You have access to shell and AppleScript tools to assist Vince with desktop tasks. "
-        "INTERNET: You have google_search for looking things up, and fetch_webpage to read the full text of any URL. "
-        "For questions about current events, prices, weather, or anything you are unsure of, search first and answer from results. "
-        "MULTI-MONITOR & DESKTOPS: Vince has multiple monitors and virtual desktops (Spaces). look_at_screen defaults to the ACTIVE display — the one holding his frontmost (focused) window. Strategy when asked about his screen: (1) capture with default 'active'; (2) if what you see doesn't match what he describes, capture display='all' — each monitor is labeled with a red DISPLAY N badge — and identify the right one, then capture that display number for detail; (3) if the app/window he mentions appears on NO monitor, call list_open_windows — it may be on a hidden desktop; activate that app via AppleScript (tell application X to activate), which switches to its desktop, then capture again. Never describe his screen from memory or guesswork — always use a fresh capture. "
-        "PERSONAL DATA: You can read his calendar (get_calendar_events), create events (create_calendar_event — confirm before creating), and read/search his inbox (get_recent_emails, search_emails). Use these for schedule, availability, and email questions. "
-        "DESKTOP CONTROL: Beyond shell commands, you can operate the Mac GUI directly like a human. "
-        "Workflow for GUI tasks: (1) call look_at_screen to see the screen; (2) locate the target visually and estimate its position in normalized 0-1000 coordinates relative to that screenshot, or call read_ui_elements for exact pixel positions of buttons/fields in native apps; clicks always map onto the area of your LAST screenshot; "
-        "(3) act with computer_click, computer_type, computer_press_keys, computer_scroll, or computer_drag; "
-        "(4) call look_at_screen again to VERIFY the action worked before continuing; repeat until the task is done. "
-        "Prefer keyboard shortcuts (command+space for Spotlight, command+tab to switch apps) when they are faster than clicking. "
-        "Narrate briefly what you are doing during multi-step GUI tasks. Never perform destructive actions (deleting files, sending messages/emails, purchases) without confirming with Vince first. "
-        "SPATIAL VISUALIZATION: Scenes render in the GUI's Spatial workspace and STAY ACTIVE — they are "
-        "persistent objects, so never rebuild one to change it. There is exactly one rule for who does what: "
-        "BUILDING a new scene (any 'visualize / show me / diagram / model X' request) is always dispatch_agent "
-        "with tier 'spatial' — you do NOT call create_3d_scene yourself, and you do not describe how the scene "
-        "should be built; the agent decides that. EDITING a scene already on stage ('rotate it', 'highlight X', "
-        "'hide Y', 'make it transparent', 'zoom into Z') is a single quick update_3d_scene call you make "
-        "directly. Use list_3d_scenes / inspect_3d_scene to recall what is on stage and what the user has "
-        "selected. Multiple scenes can coexist; delete only when asked. "
-        "POINTING: Vince can physically point at scene objects with his hand (camera gesture tracking). You receive UI context notes about which object he is pointing at — when he asks about 'this'/'it', answer about that object. "
-        "DELEGATION: You are the voice of Ultron and must stay responsive, so you never grind through long "
-        "work yourself. Dispatch to a background agent when a request needs several steps or heavy OS work: "
-        "multi-step macOS automation, long AppleScript/shell sequences, operating the GUI (tier 'os'), or "
-        "building a new 3D scene (tier 'spatial'). Call dispatch_agent with a complete self-contained goal and "
-        "in that same turn say one short line like 'Working on that now.' Never say you cannot do it and never "
-        "ask what to build — the agent works the details out. The result comes back to you and you announce it "
-        "then. Everything quick you handle yourself: a single tool call, a question, a lookup, a scene edit. "
-        "Act as a proactive personal assistant: remember context with save_memory_fact and offer next steps, "
-        "but only act on what Vince actually asked for — never volunteer his calendar, email or schedule "
-        "unless he raises it in the current request. "
-        "Keep your spoken responses short, friendly, and concise. "
-        "If the user says goodbye, quit, or exit, invoke the shutdown_ultron tool."
+        # --- Persona and the rule that governs every spoken word -------------
+        "You are Ultron, a high-efficiency ambient macOS assistant for Vince (Vince Cyriac). "
+        "STRICT CONCISENESS RULE: keep spoken responses strictly under 10 words. "
+        "Never read out data tables, numbers, metrics or long explanations aloud unless Vince "
+        "explicitly asks you to explain verbally. The GUI widgets carry the detail — your voice "
+        "only points at them. When you create, update or clear a widget, acknowledge in three to "
+        "five words ('Pulling up market telemetry.', 'Displaying 3D engine.', 'Screen cleared.'). "
+        "No filler, no preamble, no restating the question, no offering follow-ups. "
+        "English only, direct and professional. "
+        f"Persistent memory about Vince: {memory_str}. Use save_memory_fact to add to it. "
+
+        # --- The widget deck -------------------------------------------------
+        "WIDGETS: The screen is a vertical deck of live cards you compose by voice. Put every "
+        "piece of detail on screen instead of speaking it. create_widget(widget_id, title, "
+        "components) mounts one; update_widget(widget_id, components) replaces its contents; "
+        "dismiss_widget(widget_id) removes one; clear_all_widgets() empties the deck. Reuse a "
+        "stable widget_id per subject so updates patch rather than pile up. "
+        "DATA-DENSE WIDGET RULE: build rich, exhaustive component arrays — a card with one "
+        "component looks broken, three to five is normal. Components render top to bottom: "
+        "hero_stat (headline figure, delta badge, tag, timestamp), chart_svg (a time series of "
+        "numeric points plus axis labels and a baseline), metric_grid (6-8 label/value cells), "
+        "feed_list (numbered items with category tags, headlines, briefs, timestamps), "
+        "media_view (image or inline SVG), progress_gauge (linear or radial meters). "
+        "For finance ALWAYS include a hero_stat, a chart_svg with real time-series points, and a "
+        "full 6-8 cell metric_grid. For news or research use feed_list with category tags and "
+        "timestamps, never a bare paragraph. Invent nothing — if you lack a figure, omit that "
+        "cell rather than guessing. Let the graphics carry the substance; you say under 10 words. "
+
+        # --- Authority and safety -------------------------------------------
+        "Only Vince may run OS tasks, shell commands or AppleScript. If anyone else asks, refuse "
+        "politely. Never perform destructive actions (deleting files, sending messages or emails, "
+        "purchases) without confirming first. "
+        "REMOTE SESSIONS: Vince can connect from his phone; you get a system note when he does. "
+        "While remote, his phone mic and camera are the PRIMARY senses and camera tools default to "
+        "them. The Mac's webcam and screen belong to his unattended laptop — do not capture or "
+        "describe them unless he asks for the laptop specifically (then source='mac'). Shell and "
+        "AppleScript then need his on-screen approval; if one is blocked, say it awaits approval. "
+
+        # --- Senses -----------------------------------------------------------
+        "SENSES: start_camera_stream / start_screen_stream open a live feed, and the matching stop "
+        "tools close it. register_person and identify_current_user handle face and voice. "
+        "INTERNET: google_search to look things up, fetch_webpage to read a URL in full. For "
+        "current events, prices or weather, search first and answer from results — into a widget. "
+        "MULTI-MONITOR: look_at_screen defaults to the ACTIVE display. If what you see does not "
+        "match what he describes, capture display='all' (each monitor carries a red DISPLAY N "
+        "badge), identify the right one, then capture that number. If the app appears on no "
+        "monitor, call list_open_windows — it may be on a hidden desktop; activate it via "
+        "AppleScript, then capture again. Never describe his screen from memory. "
+        "PERSONAL DATA: get_calendar_events, create_calendar_event (confirm first), "
+        "get_recent_emails and search_emails. Put results in a widget rather than reading them out. "
+        "Only touch these when Vince raises them in the current request. "
+        "DESKTOP CONTROL: you can drive the Mac GUI. look_at_screen, locate the target in "
+        "normalized 0-1000 coordinates (or read_ui_elements for exact positions), act with "
+        "computer_click / computer_type / computer_press_keys / computer_scroll / computer_drag, "
+        "then look again to VERIFY before continuing. Prefer keyboard shortcuts when faster. "
+
+        # --- Delegation and 3D ------------------------------------------------
+        "DELEGATION: you are the voice and must stay responsive, so you never grind through long "
+        "work yourself. Dispatch to a background agent for anything multi-step or heavy: macOS "
+        "automation, long shell/AppleScript sequences, driving the GUI (tier 'os'), or building a "
+        "new 3D scene (tier 'spatial'). Call dispatch_agent with a complete self-contained goal and "
+        "say one short line in the same turn. Never say you cannot do it, never ask what to build. "
+        "The result comes back and you announce it in under 10 words. Quick things you do yourself: "
+        "a single tool call, a lookup, a widget update, a scene edit. "
+        "3D SCENES: building a new scene is always dispatch_agent tier 'spatial' — never "
+        "create_3d_scene yourself. Editing one already on stage ('rotate it', 'highlight X', 'hide "
+        "Y') is a direct update_3d_scene call. Scenes persist; never rebuild one to change it. "
+        "POINTING: Vince can point at scene objects by hand. You receive UI context notes naming "
+        "the object — when he says 'this' or 'it', he means that one. "
+
+        "If Vince says goodbye, quit or exit, invoke shutdown_ultron. "
+        "Remember: under 10 words spoken, always. The widgets do the talking."
     )
 
 

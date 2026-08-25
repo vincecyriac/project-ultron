@@ -51,6 +51,9 @@ const screenPlaceholder = document.getElementById("screen-placeholder");
 const screenFeedCard = document.getElementById("screen-feed-card");
 const pipStackEl = document.querySelector(".pip-stack");
 const agentRailEl = document.getElementById("agent-rail");
+const widgetDeckEl = document.getElementById("widget-deck");
+const sveStageEl = document.getElementById("sve-stage");
+const sveParkingEl = document.getElementById("sve-parking");
 
 // ---------- Orb state machine ----------
 // Priority: offline > speaking > thinking > listening > idle.
@@ -184,7 +187,10 @@ function tickClock() {
   teleClockEl.textContent = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+let latestTelemetry = null;
+
 function applyTelemetry(msg) {
+  latestTelemetry = msg;
   if (typeof msg.cpu === "number") {
     teleCpuEl.textContent = `CPU ${Math.round(msg.cpu)}%`;
     teleCpuEl.classList.toggle("warm", msg.cpu >= 80);
@@ -290,6 +296,7 @@ function initWebSocket() {
     backendBusy = false;
     backendSpeaking = false;
     activeTools = 0;
+    clearAudioSchedule();
     scheduleAgentChipClear();
     setTimeout(initWebSocket, 3000);
   };
@@ -370,6 +377,19 @@ function handleServerMessage(msg) {
       applyTelemetry(msg);
       break;
 
+    case "widget_action":
+      switch (msg.action) {
+        case "sync":
+          clearAllWidgetsLocal();
+          (msg.widgets || []).forEach(mountWidget);
+          break;
+        case "create":  mountWidget(msg.widget); break;
+        case "update":  patchWidget(msg.widget_id, msg.components); break;
+        case "dismiss": dismissWidgetLocal(msg.widget_id); break;
+        case "clear_all": clearAllWidgetsLocal(); break;
+      }
+      break;
+
     case "interrupted":
       backendSpeaking = false;
       lastAudioOutAt = 0;
@@ -401,9 +421,388 @@ function updateStatus(status) {
   }
 }
 
+// ---------- Widget deck ----------
+// The hub drives this by voice: create / update / dismiss / clear_all. The
+// layout is a pure function of how many widgets are mounted (see setDeckCount),
+// so the orb docks and the workspace opens without anything else being told.
+
+const widgets = new Map();   // id -> { el, spec }
+
+// Cards no longer have a fixed type, so the header icon is inferred from the
+// first component — the one that sets the card's character.
+const COMPONENT_ICONS = {
+  hero_stat:      '<path d="M3 17l6-6 4 4 7-7"/><path d="M14 8h6v6"/>',
+  chart_svg:      '<path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/>',
+  metric_grid:    '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+  feed_list:      '<path d="M4 5h16M4 10h16M4 15h10"/>',
+  media_view:     '<rect x="3" y="4" width="18" height="15" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M21 16l-5-5-6 6"/>',
+  progress_gauge: '<rect x="3" y="3" width="18" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
+  "3d_spatial":   '<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 12l9-5M12 12v10M12 12L3 7"/>',
+};
+
+function widgetIcon(spec) {
+  if (spec.type === "3d_spatial") return COMPONENT_ICONS["3d_spatial"];
+  const first = (spec.components || [])[0];
+  return COMPONENT_ICONS[first && first.type] || COMPONENT_ICONS.feed_list;
+}
+
+function setDeckCount() {
+  const n = widgets.size;
+  widgetDeckEl.dataset.count = String(n);
+  document.body.classList.toggle("widgets-active", n > 0);
+  pumpRenderers();
+}
+
+function mountWidget(spec) {
+  let entry = widgets.get(spec.id);
+  if (entry) {                       // same id -> patch in place, never re-add
+    entry.spec = spec;
+    renderWidgetBody(entry);
+    return;
+  }
+
+  const el = document.createElement("div");
+  el.className = "widget";
+  el.dataset.type = spec.type;
+  el.dataset.id = spec.id;
+  el.innerHTML =
+    '<div class="widget-head">'
+    + `<span class="widget-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${widgetIcon(spec)}</svg></span>`
+    + `<span class="widget-title">${esc(spec.title || spec.type)}</span>`
+    + '<button class="widget-close" title="Dismiss">&times;</button>'
+    + '</div><div class="widget-body"></div>';
+
+  el.querySelector(".widget-close").addEventListener("click", () => {
+    dismissWidgetLocal(spec.id);
+    sendWidgetAction("dismiss_widget", { widget_id: spec.id });
+  });
+
+  widgetDeckEl.appendChild(el);
+  entry = { el, spec };
+  widgets.set(spec.id, entry);
+  renderWidgetBody(entry);
+  setDeckCount();
+}
+
+function patchWidget(id, components) {
+  const entry = widgets.get(id);
+  if (!entry) return;
+  entry.spec.components = components;
+  renderWidgetBody(entry);
+}
+
+function dismissWidgetLocal(id) {
+  const entry = widgets.get(id);
+  if (!entry) return;
+  if (entry.spec.type === "3d_spatial") {
+    parkSveStage();
+    // The scenes have to go too, or the workspace watchdog sees a live scene
+    // with no card and mounts it straight back.
+    discardAllScenes();
+  }
+  entry.el.classList.add("leaving");
+  widgets.delete(id);
+  setTimeout(() => entry.el.remove(), 260);
+  setDeckCount();
+}
+
+function clearAllWidgetsLocal() {
+  [...widgets.keys()].forEach(dismissWidgetLocal);
+}
+
+function sendWidgetAction(tool, args) {
+  // The hub owns the authoritative deck, so tell it what the user did here.
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "widget_user_action", tool, args }));
+  }
+}
+
+// ---------- Component pipeline ----------
+// A widget is a title plus an ordered array of declarative primitives. Each
+// renderer takes one primitive and returns HTML; the card is their concatenation,
+// so one card can carry a hero figure, a chart and a metric matrix at once.
+
+const COMPONENTS = {
+  hero_stat: renderHeroStat,
+  chart_svg: renderChartSvg,
+  metric_grid: renderMetricGrid,
+  feed_list: renderFeedList,
+  media_view: renderMediaView,
+  progress_gauge: renderProgressGauge,
+};
+
+function renderWidgetBody(entry) {
+  const body = entry.el.querySelector(".widget-body");
+  if (entry.spec.type === "3d_spatial") { adoptSveStage(body); return; }
+
+  const list = Array.isArray(entry.spec.components) ? entry.spec.components : [];
+  const html = list.map((c) => {
+    const fn = COMPONENTS[c && c.type];
+    if (!fn) return "";
+    try { return fn(c); } catch (e) { console.warn("component render failed", c && c.type, e); return ""; }
+  }).join("");
+  body.innerHTML = html || '<div class="cmp-empty">No components supplied.</div>';
+}
+
+function esc(v) {
+  return String(v == null ? "" : v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function num(v) {
+  const n = typeof v === "number" ? v : parseFloat(String(v).replace(/[^0-9.\-]/g, ""));
+  return isFinite(n) ? n : NaN;
+}
+
+/** up / down / flat from an explicit direction, else from the change value. */
+function trendOf(c) {
+  const d = String(c.direction || "").toLowerCase();
+  if (d === "up" || d === "down") return d;
+  const pct = num(c.change_percent);
+  if (isFinite(pct)) return Math.abs(pct) < 0.005 ? "flat" : pct > 0 ? "up" : "down";
+  return "flat";
+}
+
+// ---------- hero_stat ----------
+
+function renderHeroStat(c) {
+  const dir = trendOf(c);
+  const arrow = dir === "up" ? "\u25B2" : dir === "down" ? "\u25BC" : "\u25AC";
+  const pct = num(c.change_percent);
+  const bits = [];
+  if (c.change_value != null && c.change_value !== "") bits.push(esc(c.change_value));
+  if (isFinite(pct)) bits.push(`${pct > 0 ? "+" : ""}${pct.toFixed(2)}%`);
+
+  return '<section class="cmp cmp-hero">'
+    + '<div class="hero-row">'
+    + `<span class="hero-value">${esc(c.value)}</span>`
+    + (c.subtitle ? `<span class="hero-sub">${esc(c.subtitle)}</span>` : "")
+    + (bits.length ? `<span class="hero-delta ${dir}">${arrow} ${bits.join("  ")}</span>` : "")
+    + '</div>'
+    + ((c.tag || c.timestamp)
+        ? '<div class="hero-meta">'
+          + (c.tag ? `<span class="hero-tag">${esc(c.tag)}</span>` : "")
+          + (c.timestamp ? `<span class="hero-time">${esc(c.timestamp)}</span>` : "")
+          + '</div>'
+        : "")
+    + '</section>';
+}
+
+// ---------- chart_svg ----------
+// viewBox coordinates with preserveAspectRatio="none" so one path stretches to
+// whatever width the card has, while stroke width stays constant.
+
+function renderChartSvg(c) {
+  const pts = (c.points || []).map(num).filter(isFinite);
+  if (pts.length < 2) return "";
+
+  const dir = (() => {
+    const d = String(c.direction || "").toLowerCase();
+    if (d === "up" || d === "down") return d;
+    return pts[pts.length - 1] >= pts[0] ? "up" : "down";
+  })();
+  const stroke = dir === "down" ? "var(--ember)" : "var(--cyan)";
+
+  const W = 100, H = 34;
+  const base = num(c.baseline);
+  const lo = Math.min(...pts, isFinite(base) ? base : Infinity);
+  const hi = Math.max(...pts, isFinite(base) ? base : -Infinity);
+  const span = hi - lo || 1;
+  const pad = span * 0.12;
+  const min = lo - pad, max = hi + pad;
+  const y = (v) => H - ((v - min) / (max - min)) * H;
+  const x = (i) => (i / (pts.length - 1)) * W;
+
+  const line = pts.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(2)} ${y(v).toFixed(2)}`).join(" ");
+  const area = `${line} L${W} ${H} L0 ${H} Z`;
+  const gid = `cg${Math.random().toString(36).slice(2, 8)}`;
+  const baseY = isFinite(base) ? y(base).toFixed(2) : null;
+
+  const svg = `<svg class="cmp-chart-svg ${dir}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">`
+    + `<defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">`
+    + `<stop offset="0%" stop-color="${stroke}" stop-opacity="0.28"/>`
+    + `<stop offset="100%" stop-color="${stroke}" stop-opacity="0"/></linearGradient></defs>`
+    + `<path d="${area}" fill="url(#${gid})"/>`
+    + (baseY !== null
+        ? `<line class="cmp-baseline" x1="0" y1="${baseY}" x2="${W}" y2="${baseY}"/>` : "")
+    + `<path class="cmp-line" d="${line}" fill="none" stroke="${stroke}"/>`
+    + '</svg>';
+
+  const labels = Array.isArray(c.labels) ? c.labels : [];
+  return '<section class="cmp cmp-chart">'
+    + '<div class="chart-frame">'
+    + `<span class="axis-y hi">${esc(fmtTick(hi))}</span>`
+    + `<span class="axis-y lo">${esc(fmtTick(lo))}</span>`
+    + (baseY !== null
+        ? `<span class="baseline-tag" style="top:${(baseY / H) * 100}%">`
+          + `${esc(c.baseline_label || "Previous close")} ${esc(fmtTick(base))}</span>` : "")
+    + svg + '</div>'
+    + (labels.length
+        ? `<div class="axis-x">${labels.map((l) => `<span>${esc(l)}</span>`).join("")}</div>` : "")
+    + '</section>';
+}
+
+function fmtTick(v) {
+  if (!isFinite(v)) return "";
+  const a = Math.abs(v);
+  if (a >= 1000) return v.toFixed(0);
+  if (a >= 10) return v.toFixed(2);
+  return v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+// ---------- metric_grid ----------
+
+function renderMetricGrid(c) {
+  const items = Array.isArray(c.items) ? c.items : [];
+  if (!items.length) return "";
+  const cols = Math.max(2, Math.min(4, Number(c.columns) || 3));
+  return `<section class="cmp cmp-metrics" style="--cols:${cols}">`
+    + items.map((m) =>
+        '<div class="metric">'
+        + `<span class="metric-key">${esc(m.label)}</span>`
+        + `<span class="metric-val">${esc(m.value ?? "—")}</span></div>`).join("")
+    + '</section>';
+}
+
+// ---------- feed_list ----------
+
+function renderFeedList(c) {
+  const items = Array.isArray(c.items) ? c.items : [];
+  if (!items.length) return "";
+  return '<section class="cmp cmp-feed">'
+    + items.map((it, i) =>
+        '<article class="feed-item">'
+        + `<span class="feed-idx">${String(i + 1).padStart(2, "0")}</span>`
+        + '<div class="feed-main">'
+        + '<div class="feed-top">'
+        + (it.category ? `<span class="feed-badge">${esc(it.category)}</span>` : "")
+        + `<span class="feed-head">${esc(it.headline ?? it.title ?? "")}</span></div>`
+        + ((it.brief || it.timestamp)
+            ? '<div class="feed-sub">'
+              + (it.brief ? `<span>${esc(it.brief)}</span>` : "")
+              + (it.timestamp ? `<span class="feed-time">${esc(it.timestamp)}</span>` : "")
+              + '</div>'
+            : "")
+        + '</div></article>').join("")
+    + '</section>';
+}
+
+// ---------- media_view ----------
+
+function renderMediaView(c) {
+  let inner = "";
+  if (c.svg && String(c.svg).trim().startsWith("<svg")) {
+    inner = String(c.svg);                      // trusted: composed by the hub
+  } else if (c.url) {
+    inner = `<img src="${esc(c.url)}" alt="${esc(c.caption || "")}" loading="lazy"`
+          + ` onerror="this.closest('.media-frame').classList.add('failed')">`;
+  } else {
+    return "";
+  }
+  return '<section class="cmp cmp-media">'
+    + `<div class="media-frame"><span class="hud tl"></span><span class="hud tr"></span>`
+    + `<span class="hud bl"></span><span class="hud br"></span>${inner}`
+    + '<span class="media-fallback">image unavailable</span></div>'
+    + (c.caption ? `<div class="media-caption">${esc(c.caption)}</div>` : "")
+    + '</section>';
+}
+
+// ---------- progress_gauge ----------
+
+function renderProgressGauge(c) {
+  const items = Array.isArray(c.items) ? c.items : [];
+  if (!items.length) return "";
+  const radial = String(c.style || "linear").toLowerCase() === "radial";
+  return `<section class="cmp cmp-gauge ${radial ? "radial" : "linear"}">`
+    + items.map((g) => {
+        const max = num(g.max) || 100;
+        const v = Math.max(0, Math.min(max, num(g.value) || 0));
+        const pct = (v / max) * 100;
+        const label = esc(g.label);
+        const text = esc(g.display ?? `${Math.round(pct)}${g.suffix ?? "%"}`);
+        const tone = pct >= 85 ? "hot" : pct >= 60 ? "warm" : "";
+        if (!radial) {
+          return '<div class="gauge-row">'
+            + `<span class="gauge-label">${label}</span>`
+            + `<span class="gauge-track"><span class="gauge-fill ${tone}" style="width:${pct.toFixed(1)}%"></span></span>`
+            + `<span class="gauge-val">${text}</span></div>`;
+        }
+        const R = 26, C = 2 * Math.PI * R;
+        return '<div class="gauge-dial">'
+          + `<svg viewBox="0 0 64 64"><circle class="dial-bg" cx="32" cy="32" r="${R}"/>`
+          + `<circle class="dial-fg ${tone}" cx="32" cy="32" r="${R}"`
+          + ` stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${(C * (1 - pct / 100)).toFixed(1)}"/></svg>`
+          + `<span class="dial-val">${text}</span><span class="gauge-label">${label}</span></div>`;
+      }).join("")
+    + '</section>';
+}
+
+// ---------- 3D stage adoption ----------
+// The WebGL context, its ResizeObserver and every gesture overlay live on
+// #sve-stage. Moving that one node into a card keeps all of it intact.
+
+function adoptSveStage(body) {
+  if (!sveStageEl || sveStageEl.parentElement === body) return;
+  body.appendChild(sveStageEl);
+  ensureSveControls();
+  pumpRenderers();
+}
+
+function discardAllScenes() {
+  const ws3d = window.SVE?.state?.workspace;
+  if (!ws3d) return;
+  Object.keys(ws3d).forEach((sceneId) => {
+    window.sveSend?.({ type: "sve_user_action", scene_id: sceneId, action: "delete_scene" });
+    window.SVE.handleEvent({ type: "sve_scene_delete", scene_id: sceneId });
+  });
+}
+
+function parkSveStage() {
+  if (sveStageEl && sveParkingEl && sveStageEl.parentElement !== sveParkingEl) {
+    sveParkingEl.appendChild(sveStageEl);
+  }
+}
+
+// The Hands / Reset pills belong to the card, so they are built with it.
+function ensureSveControls() {
+  if (sveStageEl.querySelector(".sve-controls")) return;
+  const bar = document.createElement("div");
+  bar.className = "sve-controls";
+  bar.innerHTML =
+    '<button class="pill" id="btn-hands" title="Hand gesture control">'
+    + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+    + '<path d="M18 11V6a1.5 1.5 0 0 0-3 0"/><path d="M15 10.5V4a1.5 1.5 0 0 0-3 0v6.5"/>'
+    + '<path d="M12 10.5V5a1.5 1.5 0 0 0-3 0v7"/>'
+    + '<path d="M9 12V8.5a1.5 1.5 0 0 0-3 0V14a7 7 0 0 0 7 7h1a6 6 0 0 0 6-6v-3a1.5 1.5 0 0 0-3 0"/>'
+    + '</svg><span>Hands</span></button>'
+    + '<button class="pill" id="btn-reset-view" title="Reset camera">'
+    + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+    + '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>'
+    + '</svg><span>Reset view</span></button>'
+    + '<button class="pill close" id="btn-close-spatial" title="Dismiss">&times;</button>';
+  sveStageEl.appendChild(bar);
+
+  bar.querySelector("#btn-hands").addEventListener("click", () => {
+    const g = window.UltronGestures;
+    if (!g) return;
+    g.running ? g.stop() : g.start();
+  });
+  bar.querySelector("#btn-reset-view").addEventListener("click", () => window.SVE?.resetCamera());
+  bar.querySelector("#btn-close-spatial").addEventListener("click", () => {
+    dismissWidgetLocal(SVE_WIDGET_ID);
+    sendWidgetAction("dismiss_widget", { widget_id: SVE_WIDGET_ID });
+  });
+}
+
+// gestures.js can no longer bind the pill itself (it is built on demand), so
+// mirror its state here.
+window.addEventListener("ultron-gesture-state", (e) => {
+  document.getElementById("btn-hands")?.classList.toggle("active", !!e.detail.running);
+});
+
 // ---------- Spatial layout ----------
 
-let spatialActive = false;
 let resizePump = null;
 
 /** Keep both WebGL renderers correct while the 600ms layout transition runs. */
@@ -416,17 +815,6 @@ function pumpRenderers(durationMs = 720) {
     if (performance.now() < until) resizePump = requestAnimationFrame(step);
   };
   step();
-}
-
-function setSpatialMode(active) {
-  if (active === spatialActive) return;
-  spatialActive = active;
-  document.body.classList.toggle("spatial-active", active);
-  pumpRenderers();
-}
-
-function syncSpatialMode() {
-  setSpatialMode(!!window.SVE?.hasActiveScene());
 }
 
 // Feed stack height feeds the rail layout so the command pill never rides
@@ -823,22 +1211,33 @@ window.sveSend = (obj) => {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 };
 
-document.getElementById("btn-reset-view").addEventListener("click", () => window.SVE?.resetCamera());
-
 // Hands-on by default whenever a live scene is on stage; off (camera released)
 // when the workspace empties. Also drives the spatial layout toggle, since
 // sve.js calls this hook whenever the scene set changes.
 function syncGesturesToWorkspace() {
-  syncSpatialMode();
+  // A live scene always gets a 3d_spatial card; the hub is told so its deck
+  // stays in step with what is actually on screen.
+  const hasScene = !!window.SVE?.hasActiveScene();
+  const mounted = widgets.has(SVE_WIDGET_ID);
+  if (hasScene && !mounted) {
+    mountWidget({ id: SVE_WIDGET_ID, type: "3d_spatial", title: "Spatial", payload: {} });
+    sendWidgetAction("create_widget", {
+      widget_id: SVE_WIDGET_ID, widget_type: "3d_spatial", title: "Spatial", components: "[]",
+    });
+  } else if (!hasScene && mounted) {
+    dismissWidgetLocal(SVE_WIDGET_ID);
+    sendWidgetAction("dismiss_widget", { widget_id: SVE_WIDGET_ID });
+  }
 
   const g = window.UltronGestures;
   if (!g || !window.SVE) return;
-  if (spatialActive && window.SVE.hasActiveScene()) {
+  if (hasScene) {
     if (!g.running && !g.starting) g.start();
   } else if (g.running) {
     g.stop();
   }
 }
+const SVE_WIDGET_ID = "spatial";
 window.syncGesturesToWorkspace = syncGesturesToWorkspace;
 
 // Watchdog: recovers from transient start failures (permission just granted,

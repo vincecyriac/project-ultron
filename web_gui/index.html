@@ -64,36 +64,22 @@
     </div>
   </div>
 
-  <!-- Spatial workspace: exclusive right column, never overlaps the rail -->
-  <div class="workspace" id="workspace">
-    <div class="sve-frame">
-      <div class="sve-controls">
-        <div class="sve-scene-tabs" id="sve-scene-tabs"></div>
-        <button class="pill" id="btn-hands" title="Hand gesture control">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M18 11V6a1.5 1.5 0 0 0-3 0"></path>
-            <path d="M15 10.5V4a1.5 1.5 0 0 0-3 0v6.5"></path>
-            <path d="M12 10.5V5a1.5 1.5 0 0 0-3 0v7"></path>
-            <path d="M9 12V8.5a1.5 1.5 0 0 0-3 0V14a7 7 0 0 0 7 7h1a6 6 0 0 0 6-6v-3a1.5 1.5 0 0 0-3 0"></path>
-          </svg>
-          <span>Hands</span>
-        </button>
-        <button class="pill" id="btn-reset-view" title="Reset camera">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="1 4 1 10 7 10"></polyline>
-            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
-          </svg>
-          <span>Reset view</span>
-        </button>
-      </div>
+  <!-- Widget deck: right-hand workspace, never overlaps the rail or camera PIP -->
+  <div class="workspace" id="workspace-container">
+    <div class="widget-deck" id="widget-deck"></div>
+  </div>
 
-      <div class="sve-stage">
-        <div id="sve-viewport"></div>
-        <div class="gesture-cursor" id="gesture-cursor"></div>
-        <div class="gesture-hud" id="gesture-hud"></div>
-        <div class="sve-info" id="sve-info"></div>
-        <div class="empty-state" id="sve-empty"></div>
-      </div>
+  <!-- The 3D stage lives here while no 3d_spatial widget is mounted; app.js
+       moves this whole node into the widget card and back, so the WebGL
+       context and its ResizeObserver survive intact. -->
+  <div class="sve-parking" id="sve-parking" aria-hidden="true">
+    <div class="sve-stage" id="sve-stage">
+      <div id="sve-viewport"></div>
+      <div class="gesture-cursor" id="gesture-cursor"></div>
+      <div class="gesture-hud" id="gesture-hud"></div>
+      <div class="sve-info" id="sve-info"></div>
+      <div class="empty-state" id="sve-empty"></div>
+      <div class="sve-scene-tabs" id="sve-scene-tabs"></div>
     </div>
   </div>
 
