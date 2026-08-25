@@ -8,6 +8,7 @@ shutdown and the audio devices, sockets and servers are released.
 """
 
 import asyncio
+import os
 import signal
 import socket
 import sys
@@ -18,7 +19,14 @@ import ultron_hub
 
 GUI_HOST = "127.0.0.1"
 GUI_PORT = 8766
+# A fixed http:// origin, never file://. Browsers key camera/mic grants to the
+# origin, and a file:// or shifting port re-prompts on every launch.
 GUI_URL = f"http://{GUI_HOST}:{GUI_PORT}/"
+
+# WKWebView keeps permission grants in its website data store. pywebview's
+# default private_mode wipes that store on every start, which is what made the
+# camera and microphone prompt come back each launch.
+WEBVIEW_STORAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".webview")
 
 BOOT_TIMEOUT = 45.0     # engine has this long to serve the GUI
 STOP_TIMEOUT = 10.0     # then this long to shut down before we stop waiting
@@ -71,9 +79,44 @@ def stop_backend(backend, reason):
         print("[Ultron Desktop] Engine did not stop in time; exiting anyway.")
 
 
+def grant_media_capture():
+    """Auto-approve the WKWebView camera/mic prompt.
+
+    pywebview installs a UI delegate but never implements the media-capture
+    decision method, so WKWebView falls back to asking. Vince already granted
+    the app itself at the OS level; asking again inside the embedded page every
+    launch is pure friction. No-op off macOS or if the private API shifts.
+    """
+    try:
+        import objc
+        from webview.platforms import cocoa
+    except Exception:
+        return False
+
+    delegate = cocoa.BrowserView.BrowserDelegate
+    selector = b"webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:"
+    try:
+        if delegate.instancesRespondToSelector_(selector):
+            return True
+
+        def _decide(self, webView, origin, frame, capture_type, decisionHandler):
+            decisionHandler(1)          # WKPermissionDecisionGrant
+
+        objc.classAddMethods(delegate, [
+            objc.selector(_decide, selector=selector, signature=b"v@:@@@q@?")
+        ])
+        return True
+    except Exception as e:
+        print(f"[Ultron Desktop] Could not auto-grant media capture: {e}")
+        return False
+
+
 def run_windowed(backend):
     """PyWebView window. Must own the main thread on macOS."""
     import webview
+
+    granted = grant_media_capture()
+    os.makedirs(WEBVIEW_STORAGE, exist_ok=True)
 
     window = webview.create_window(
         title="Project Ultron - AI Desktop Assistant",
@@ -98,7 +141,11 @@ def run_windowed(backend):
 
     ultron_hub.on_shutdown(close_window)
 
-    webview.start(debug=False)
+    # private_mode=False keeps the data store (and its permission grants) on
+    # disk between launches; storage_path pins where that lives.
+    webview.start(debug=False, private_mode=False, storage_path=WEBVIEW_STORAGE)
+    if not granted:
+        print("[Ultron Desktop] Media capture prompts may still appear.")
     # start() returns once the window is gone, for whichever of the two reasons.
     stop_backend(backend, "window closed")
 

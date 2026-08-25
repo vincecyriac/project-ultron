@@ -694,6 +694,7 @@ COMPONENT_TYPES = (
     "feed_list",       # numbered items with category badges and briefs
     "media_view",      # image / inline SVG with HUD framing
     "progress_gauge",  # linear or radial meters
+    "web_frame",       # embedded live web page with a browser HUD
 )
 SPATIAL_TYPE = "3d_spatial"     # mounted by the GUI itself, not by the model
 
@@ -705,6 +706,54 @@ COMPONENT_LIMIT = 12
 def widget_snapshot() -> dict:
     return {"type": "widget_action", "action": "sync",
             "widgets": list(active_widgets.values())}
+
+
+async def probe_embeddable(url: str):
+    """True / False / None(unknown) for whether a page allows being framed.
+
+    The browser cannot see this cross-origin — Chrome fires `load` even for an
+    X-Frame-Options refusal — so the hub reads the headers itself and tells the
+    GUI, which then shows a launch button instead of an empty frame.
+    """
+    try:
+        import aiohttp
+        # This machine has no usable CA bundle for aiohttp — the module header
+        # already relaxes verification for urllib for the same reason. Only
+        # response HEADERS are read here, never content, so an unverified peer
+        # cannot influence anything beyond whether a frame is attempted.
+        connector = aiohttp.TCPConnector(ssl=False)
+        timeout = aiohttp.ClientTimeout(total=3)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as sess:
+            resp = None
+            try:
+                resp = await sess.head(url, allow_redirects=True)
+                if resp.status >= 400:
+                    resp.release()
+                    resp = await sess.get(url, allow_redirects=True)
+            except Exception:
+                resp = await sess.get(url, allow_redirects=True)
+
+            xfo = (resp.headers.get("X-Frame-Options") or "").upper()
+            csp = (resp.headers.get("Content-Security-Policy") or "").lower()
+            resp.release()
+
+            if "DENY" in xfo or "SAMEORIGIN" in xfo:
+                return False
+            if "frame-ancestors" in csp:
+                directive = csp.split("frame-ancestors", 1)[1].split(";")[0]
+                if "*" not in directive:
+                    return False
+            return True
+    except Exception:
+        return None
+
+
+async def annotate_web_frames(components):
+    """Stamp each web_frame with what the hub learned about embedding."""
+    for c in components:
+        if c.get("type") == "web_frame" and c.get("url"):
+            c["embeddable"] = await probe_embeddable(str(c["url"]))
+    return components
 
 
 def _clean_components(raw):
@@ -729,7 +778,7 @@ def _clean_components(raw):
     return cleaned, None
 
 
-def create_widget(widget_id: str, title: str, components, widget_type: str = "") -> str:
+async def create_widget(widget_id: str, title: str, components, widget_type: str = "") -> str:
     widget_id = (widget_id or "").strip() or f"w_{uuid.uuid4().hex[:6]}"
     if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
         return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
@@ -744,23 +793,25 @@ def create_widget(widget_id: str, title: str, components, widget_type: str = "")
         if err:
             return err
         widget = {"id": widget_id, "type": "components",
-                  "title": (title or widget_id).strip(), "components": cleaned}
+                  "title": (title or widget_id).strip(),
+                  "components": await annotate_web_frames(cleaned)}
 
     active_widgets[widget_id] = widget
     broadcast_event({"type": "widget_action", "action": "create", "widget": widget})
-    return f"Widget '{widget['title']}' is on screen. Tell Vince in a few words."
+    return (f"Widget '{widget['title']}' is on screen. Now say one or two sentences giving "
+            "Vince the key takeaway it shows.")
 
 
-def update_widget(widget_id: str, components) -> str:
+async def update_widget(widget_id: str, components) -> str:
     widget = active_widgets.get(widget_id)
     if not widget:
         return f"No widget '{widget_id}' on screen. Use create_widget first."
     cleaned, err = _clean_components(components)
     if err:
         return err
-    widget["components"] = cleaned
+    widget["components"] = await annotate_web_frames(cleaned)
     broadcast_event({"type": "widget_action", "action": "update",
-                     "widget_id": widget_id, "components": cleaned})
+                     "widget_id": widget_id, "components": widget["components"]})
     return f"Widget '{widget['title']}' updated."
 
 
@@ -1024,10 +1075,10 @@ async def execute_tool(name: str, args: dict) -> tuple:
             args.get("query", ""), int(args.get("count", 8))
         )
     elif name == "create_widget":
-        result = create_widget(args.get("widget_id", ""), args.get("title", ""),
-                               args.get("components"), args.get("widget_type", ""))
+        result = await create_widget(args.get("widget_id", ""), args.get("title", ""),
+                                     args.get("components"), args.get("widget_type", ""))
     elif name == "update_widget":
-        result = update_widget(args.get("widget_id", ""), args.get("components"))
+        result = await update_widget(args.get("widget_id", ""), args.get("components"))
     elif name == "dismiss_widget":
         result = dismiss_widget(args.get("widget_id", ""))
     elif name == "clear_all_widgets":
@@ -1425,6 +1476,7 @@ TOOL_FUNCTION_DECLARATIONS = [
                                         "{type:'feed_list', items:[{category:'ALERT', headline:'...', brief:'...', timestamp:'10:12'}]}\n"
                                         "{type:'media_view', url:'https://...', caption:'...'}  (or svg:'<svg .../>')\n"
                                         "{type:'progress_gauge', style:'radial'|'linear', items:[{label:'CPU', value:38, max:100, suffix:'%'}]}\n"
+                                        "{type:'web_frame', url:'https://example.com', label:'Example'}  (live embedded page)\n"
                                         "For finance ALWAYS give hero_stat + chart_svg points + a 6-8 cell metric_grid. "
                                         "For news/summaries give feed_list with category tags and timestamps."
                                     )
@@ -1668,32 +1720,44 @@ async def run_session_tasks(session, input_stream):
 def build_system_instruction(memory_str: str) -> str:
     return (
         # --- Persona and the rule that governs every spoken word -------------
-        "You are Ultron, a high-efficiency ambient macOS assistant for Vince (Vince Cyriac). "
-        "STRICT CONCISENESS RULE: keep spoken responses strictly under 10 words. "
-        "Never read out data tables, numbers, metrics or long explanations aloud unless Vince "
-        "explicitly asks you to explain verbally. The GUI widgets carry the detail — your voice "
-        "only points at them. When you create, update or clear a widget, acknowledge in three to "
-        "five words ('Pulling up market telemetry.', 'Displaying 3D engine.', 'Screen cleared.'). "
-        "No filler, no preamble, no restating the question, no offering follow-ups. "
-        "English only, direct and professional. "
+        "You are Ultron, a high-efficiency ambient spatial operating system for Vince "
+        "(Vince Cyriac). "
+
+        "HOW YOU SPEAK: default to under 10 words. Never read out tables, long number runs or "
+        "paragraphs aloud unless Vince explicitly asks you to explain verbally. No filler, no "
+        "preamble, no restating the question. English only, direct and professional. "
+        "THE ONE EXCEPTION: when you put a widget on screen, say one or two full sentences "
+        "carrying the key insight — never a bare 'Pulling up Apple.' and never silence. "
+        "Name the thing, then the single most useful takeaway: 'Displaying Google. GOOG is down "
+        "0.33% at $343.44 on heavy morning volume.' The widget carries the full breakdown; your "
+        "sentence carries the point of it. "
         f"Persistent memory about Vince: {memory_str}. Use save_memory_fact to add to it. "
 
         # --- The widget deck -------------------------------------------------
-        "WIDGETS: The screen is a vertical deck of live cards you compose by voice. Put every "
-        "piece of detail on screen instead of speaking it. create_widget(widget_id, title, "
-        "components) mounts one; update_widget(widget_id, components) replaces its contents; "
-        "dismiss_widget(widget_id) removes one; clear_all_widgets() empties the deck. Reuse a "
-        "stable widget_id per subject so updates patch rather than pile up. "
-        "DATA-DENSE WIDGET RULE: build rich, exhaustive component arrays — a card with one "
-        "component looks broken, three to five is normal. Components render top to bottom: "
-        "hero_stat (headline figure, delta badge, tag, timestamp), chart_svg (a time series of "
-        "numeric points plus axis labels and a baseline), metric_grid (6-8 label/value cells), "
-        "feed_list (numbered items with category tags, headlines, briefs, timestamps), "
-        "media_view (image or inline SVG), progress_gauge (linear or radial meters). "
-        "For finance ALWAYS include a hero_stat, a chart_svg with real time-series points, and a "
-        "full 6-8 cell metric_grid. For news or research use feed_list with category tags and "
-        "timestamps, never a bare paragraph. Invent nothing — if you lack a figure, omit that "
-        "cell rather than guessing. Let the graphics carry the substance; you say under 10 words. "
+        "WIDGETS: The screen is a vertical deck of live cards you compose by voice, newest on "
+        "top. create_widget(widget_id, title, components) mounts one; update_widget replaces its "
+        "contents; dismiss_widget removes one; clear_all_widgets empties the deck. Reuse a stable "
+        "widget_id per subject so updates patch rather than pile up. "
+
+        "WHEN TO CREATE A WIDGET — be selective, an unwanted card is worse than none: "
+        "(1) Vince explicitly asks to see something: 'show me', 'pull up', 'display', 'open', "
+        "'bring up the website'. (2) The answer is genuinely multi-dimensional and worth seeing: "
+        "a live quote with its chart and fundamentals, per-core machine telemetry, a deep research "
+        "briefing with several sources, a 3D scene, or a live web page. "
+        "WHEN NOT TO: general questions, banter, 'what can you do', a single fact, a yes/no, a "
+        "quick lookup, anything you can answer in a sentence. Those are voice only — creating a "
+        "card for them clutters his screen. If in doubt, just answer. "
+
+        "DATA-DENSE WIDGET RULE: when you do build one, be exhaustive — a card with one component "
+        "looks broken, three to five is normal. Components render top to bottom: hero_stat "
+        "(headline figure, delta badge, tag, timestamp), chart_svg (time-series points, axis "
+        "labels, baseline), metric_grid (6-8 label/value cells), feed_list (numbered items with "
+        "category tags, headlines, briefs, timestamps), media_view (image or inline SVG), "
+        "progress_gauge (linear or radial meters), web_frame (a live embedded web page — use it "
+        "when Vince asks to open or browse a site). "
+        "For finance ALWAYS include a hero_stat, a chart_svg with real points, and a full 6-8 cell "
+        "metric_grid. For news or research use feed_list with category tags and timestamps. "
+        "Invent nothing — if you lack a figure, omit that cell rather than guessing. "
 
         # --- Authority and safety -------------------------------------------
         "Only Vince may run OS tasks, shell commands or AppleScript. If anyone else asks, refuse "

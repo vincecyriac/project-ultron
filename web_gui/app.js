@@ -381,7 +381,8 @@ function handleServerMessage(msg) {
       switch (msg.action) {
         case "sync":
           clearAllWidgetsLocal();
-          (msg.widgets || []).forEach(mountWidget);
+          // prepend inverts order, so replay the snapshot oldest-last
+          (msg.widgets || []).slice().reverse().forEach(mountWidget);
           break;
         case "create":  mountWidget(msg.widget); break;
         case "update":  patchWidget(msg.widget_id, msg.components); break;
@@ -477,7 +478,9 @@ function mountWidget(spec) {
     sendWidgetAction("dismiss_widget", { widget_id: spec.id });
   });
 
-  widgetDeckEl.appendChild(el);
+  // Newest on top: the card Vince just asked for should never appear below
+  // the fold behind older ones.
+  widgetDeckEl.prepend(el);
   entry = { el, spec };
   widgets.set(spec.id, entry);
   renderWidgetBody(entry);
@@ -529,6 +532,7 @@ const COMPONENTS = {
   feed_list: renderFeedList,
   media_view: renderMediaView,
   progress_gauge: renderProgressGauge,
+  web_frame: renderWebFrame,
 };
 
 function renderWidgetBody(entry) {
@@ -536,12 +540,16 @@ function renderWidgetBody(entry) {
   if (entry.spec.type === "3d_spatial") { adoptSveStage(body); return; }
 
   const list = Array.isArray(entry.spec.components) ? entry.spec.components : [];
-  const html = list.map((c) => {
+  const html = list.map((c, i) => {
     const fn = COMPONENTS[c && c.type];
     if (!fn) return "";
-    try { return fn(c); } catch (e) { console.warn("component render failed", c && c.type, e); return ""; }
+    try { return fn(c, `${entry.spec.id}:${i}`); }
+    catch (e) { console.warn("component render failed", c && c.type, e); return ""; }
   }).join("");
   body.innerHTML = html || '<div class="cmp-empty">No components supplied.</div>';
+  // innerHTML would reload every embedded page on any patch, so live frames are
+  // kept aside and moved back into their slot instead of being recreated.
+  adoptWebFrames(body);
 }
 
 function esc(v) {
@@ -708,6 +716,115 @@ function renderMediaView(c) {
     + '</section>';
 }
 
+// ---------- web_frame ----------
+// Cross-origin frames cannot be driven through their own history, so back and
+// forward walk the URLs this card has actually been pointed at.
+
+const liveFrames = new Map();   // slot key -> { wrap, urls, at }
+
+function renderWebFrame(c, key) {
+  const url = String(c.url || "").trim();
+  if (!/^https?:\/\//i.test(url)) return "";
+  return `<section class="cmp cmp-web" data-frame="${esc(key)}" data-url="${esc(url)}"`
+       + `${c.label ? ` data-label="${esc(c.label)}"` : ""}`
+       + `${c.embeddable === false ? ' data-blocked="1"' : ""}></section>`;
+}
+
+function adoptWebFrames(body) {
+  body.querySelectorAll(".cmp-web").forEach((slot) => {
+    const key = slot.dataset.frame;
+    const url = slot.dataset.url;
+    let live = liveFrames.get(key);
+
+    if (live && live.urls[live.at] === url) {
+      slot.appendChild(live.wrap);            // same page: keep it loaded
+      return;
+    }
+    if (live) live.wrap.remove();
+    live = buildWebFrame(key, url, slot.dataset.label || hostOf(url),
+                         slot.dataset.blocked === "1");
+    liveFrames.set(key, live);
+    slot.appendChild(live.wrap);
+  });
+  // drop frames whose card or component is gone
+  [...liveFrames.keys()].forEach((k) => {
+    if (!document.querySelector(`.cmp-web[data-frame="${CSS.escape(k)}"]`)) {
+      liveFrames.get(k).wrap.remove();
+      liveFrames.delete(k);
+    }
+  });
+}
+
+function hostOf(u) {
+  try { return new URL(u).host; } catch (_) { return u; }
+}
+
+function buildWebFrame(key, url, label, knownBlocked) {
+  const wrap = document.createElement("div");
+  wrap.className = "web-wrap";
+  wrap.innerHTML =
+    '<div class="web-bar">'
+    + '<button class="web-btn back" title="Back" disabled>&#8249;</button>'
+    + '<button class="web-btn fwd" title="Forward" disabled>&#8250;</button>'
+    + '<button class="web-btn reload" title="Reload">&#8635;</button>'
+    + '<span class="web-url" title=""></span>'
+    + '<button class="web-btn ext" title="Open in browser">&#8599;</button>'
+    + '</div>'
+    + '<div class="web-stage">'
+    + '<iframe class="web-frame" referrerpolicy="no-referrer"'
+    + ' sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>'
+    + '<div class="web-fallback">'
+    + '<span class="web-fallback-title">This site refused to be embedded</span>'
+    + '<span class="web-fallback-sub"></span>'
+    + '<button class="web-open">Open in browser</button></div>'
+    + '</div>';
+
+  const state = { wrap, urls: [url], at: 0 };
+  const frame = wrap.querySelector("iframe");
+  const urlPill = wrap.querySelector(".web-url");
+  const stage = wrap.querySelector(".web-stage");
+
+  let timer = null;
+  const go = (next) => {
+    stage.classList.remove("blocked");
+    urlPill.textContent = label && state.at === 0 ? label : hostOf(next);
+    urlPill.title = next;
+    wrap.querySelector(".web-fallback-sub").textContent = next;
+    wrap.querySelector(".back").disabled = state.at === 0;
+    wrap.querySelector(".fwd").disabled = state.at >= state.urls.length - 1;
+    clearTimeout(timer);
+    // A refusal is invisible to JS cross-origin — Chrome fires `load` for the
+    // error page too — so the hub reads the headers and tells us up front.
+    // The timeout only catches a frame that never loads at all.
+    if (knownBlocked) {
+      stage.classList.add("blocked");
+      return;                       // do not even attempt the request
+    }
+    timer = setTimeout(() => stage.classList.add("blocked"), 8000);
+    frame.src = next;
+  };
+  frame.addEventListener("load", () => { clearTimeout(timer); });
+
+  wrap.querySelector(".back").addEventListener("click", () => {
+    if (state.at > 0) { state.at--; go(state.urls[state.at]); }
+  });
+  wrap.querySelector(".fwd").addEventListener("click", () => {
+    if (state.at < state.urls.length - 1) { state.at++; go(state.urls[state.at]); }
+  });
+  wrap.querySelector(".reload").addEventListener("click", () => go(state.urls[state.at]));
+  const open = () => window.open(state.urls[state.at], "_blank", "noopener");
+  wrap.querySelector(".ext").addEventListener("click", open);
+  wrap.querySelector(".web-open").addEventListener("click", open);
+
+  state.navigate = (next) => {
+    state.urls = state.urls.slice(0, state.at + 1).concat(next);
+    state.at = state.urls.length - 1;
+    go(next);
+  };
+  go(url);
+  return state;
+}
+
 // ---------- progress_gauge ----------
 
 function renderProgressGauge(c) {
@@ -834,30 +951,57 @@ window.addEventListener("resize", () => pumpRenderers(120));
 
 let remoteCamFacing = "environment"; // phone default: rear camera (show surroundings)
 
+// Releasing the last reference used to stop the device immediately, so a scene
+// closing and reopening — or the 5s workspace watchdog — re-opened the camera
+// and made the indicator light blink. The stream now lingers briefly, and a
+// re-acquire inside that window reuses it instead of calling getUserMedia again.
+const CAMERA_LINGER_MS = 4000;
+
 const UltronCamera = {
   stream: null,
   refs: 0,
+  _lingerTimer: null,
+  _opens: 0,               // getUserMedia calls, for diagnostics
   async acquire() {
     this.refs++;
+    clearTimeout(this._lingerTimer);
+    this._lingerTimer = null;
     if (!this.stream) {
       const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
       if (IS_REMOTE) video.facingMode = remoteCamFacing;
+      this._opens++;
       this.stream = await navigator.mediaDevices.getUserMedia({ video });
     }
     return this.stream;
   },
   release() {
     this.refs = Math.max(0, this.refs - 1);
-    if (this.refs === 0 && this.stream) {
+    if (this.refs > 0 || !this.stream || this._lingerTimer) return;
+    this._lingerTimer = setTimeout(() => {
+      this._lingerTimer = null;
+      if (this.refs > 0 || !this.stream) return;   // picked up again meanwhile
+      this.stream.getTracks().forEach((t) => t.stop());
+      this.stream = null;
+    }, CAMERA_LINGER_MS);
+  },
+  /** Stop the device now, regardless of the linger window. */
+  shutdown() {
+    clearTimeout(this._lingerTimer);
+    this._lingerTimer = null;
+    if (this.stream) {
       this.stream.getTracks().forEach((t) => t.stop());
       this.stream = null;
     }
+    this.refs = 0;
   },
   // Re-open with current constraints (camera flip) keeping refcount intact.
   async restart() {
     if (!this.stream) return null;
+    clearTimeout(this._lingerTimer);
+    this._lingerTimer = null;
     this.stream.getTracks().forEach((t) => t.stop());
     this.stream = null;
+    this._opens++;
     const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
     if (IS_REMOTE) video.facingMode = remoteCamFacing;
     this.stream = await navigator.mediaDevices.getUserMedia({ video });
