@@ -199,10 +199,25 @@ async function ensureLandmarker() {
   return landmarker;
 }
 
+// The HUD is a single auto-fading glass pill. It carries the "show a hand"
+// helper until MediaPipe recognises one, then only ever names the object the
+// user is pointing at or dragging — no running status commentary.
+let hintDismissed = false;
+
 function setHud(text, active = true) {
   if (!hudEl) return;
-  hudEl.textContent = text;
-  hudEl.style.display = active ? "block" : "none";
+  if (active && text) hudEl.textContent = text;
+  hudEl.classList.toggle("show", !!(active && text));
+}
+
+function showHelperHint() {
+  if (!hintDismissed) setHud("Show a hand to the camera");
+}
+
+function dismissHelperHint() {
+  if (hintDismissed) return;
+  hintDismissed = true;
+  setHud("", false);
 }
 
 function updateCursor(ndcX, ndcY, mode) {
@@ -233,10 +248,11 @@ const inputSource = {
     }
     const hands = result?.landmarks || [];
     drawMarkings(hands);
+    if (hands.length) dismissHelperHint();
 
     if (!hands.length) {
       hideCursor();
-      setHud("Hands: show a hand to the camera");
+      showHelperHint();
       endGrab();
       orbiting = false;
       lastOrbit = null;
@@ -254,7 +270,7 @@ const inputSource = {
         window.SVE.dollyCamera(Math.max(0.9, Math.min(1.1, factor)));
       }
       lastPinchSpan = span;
-      setHud("Zoom: spread / squeeze");
+      setHud("", false);
       hideCursor();
       return;
     }
@@ -286,12 +302,12 @@ const inputSource = {
       if (grabbing) {
         window.SVE.moveSelectedTo(nx, ny);
         updateCursor(nx, ny, "grab");
-        setHud(`Grab: ${window.SVE.selected?.userData.spec.label || window.SVE.selected?.userData.spec.id || ""} — release pinch to drop`);
+        setHud(window.SVE.selected?.userData.spec.label || window.SVE.selected?.userData.spec.id || "", true);
       } else if (orbiting && lastOrbit) {
         window.SVE.orbitCamera((nx - lastOrbit.x) * 2.2, (ny - lastOrbit.y) * 1.6);
         lastOrbit = { x: nx, y: ny };
         updateCursor(nx, ny, "orbit");
-        setHud("Orbit (pinch on empty space)");
+        setHud("", false);
       }
       return;
     }
@@ -305,7 +321,7 @@ const inputSource = {
       }
       lastOrbit = { x: nx, y: ny };
       updateCursor(nx, ny, "orbit");
-      setHud("Orbit (open palm)");
+      setHud("", false);
       return;
     }
     lastOrbit = null;
@@ -314,12 +330,12 @@ const inputSource = {
       updateCursor(nx, ny, "point");
       const hit = window.SVE.pickAt(nx, ny);
       reportPointedObject(hit);
-      setHud(hit ? `Point: ${hit.userData.spec.label || hit.userData.spec.id} — ask about it, or pinch to grab` : "Point: aim at an object, pinch to grab");
+      setHud(hit ? (hit.userData.spec.label || hit.userData.spec.id) : "", !!hit);
       return;
     }
 
     updateCursor(nx, ny, "idle");
-    setHud("Hands: point ☝ · pinch 🤏 grab · palm ✋ orbit · two-hand 🤏🤏 zoom");
+    setHud("", false);
   },
   dispose() {},
 };
@@ -351,11 +367,12 @@ async function startHands() {
     await video.play();
     lastVideoTime = -1;
     smoothing = null;
+    hintDismissed = false;
     running = true;
     window.SVE.registerInputSource(inputSource);
     if (overlayEl) overlayEl.style.display = "block";
     btn?.classList.add("active");
-    setHud("Hands active: point ☝ · pinch 🤏 · palm ✋ · two-hand zoom");
+    showHelperHint();
   } catch (e) {
     console.error("Hand tracking start failed:", e);
     setHud(`Hand tracking failed: ${e.message}`, true);

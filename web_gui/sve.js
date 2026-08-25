@@ -514,6 +514,11 @@ window.SVE = {
   resetCamera() {
     if (activeSceneId) setActiveScene(activeSceneId);
   },
+
+  /** Re-fit the renderer to its container — called while the spatial layout
+   *  transition runs so the viewport never stretches mid-animation. */
+  resize,
+
   registerInputSource(src) {
     // Gesture/XR extension point: src = {update(dt), dispose()} manipulating
     // the exported state below. See SVE.md "Gesture Integration Layer".

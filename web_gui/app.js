@@ -1,7 +1,13 @@
 /**
  * Ultron — frontend engine.
- * WebSocket bridge to the Python backend, echo-cancelled mic streaming,
- * chat, live feeds, tool activity, and a minimal waveform visualizer.
+ *
+ * WebSocket bridge to the Python backend: 16 kHz PCM mic capture, 24 kHz voice
+ * playback with barge-in flush, sensor toggles, live system telemetry, and the
+ * holographic orb's state/energy feed.
+ *
+ * The UI has no chrome: system state is expressed entirely through the orb's
+ * colour and energy (see orb.js), and the SVE 3D workspace slides in beside a
+ * docked orb whenever a spatial scene goes live.
  */
 
 let ws = null;
@@ -14,61 +20,141 @@ let isScreenActive = false;
 
 let audioAnalyser = null;
 let audioDataArray = null;
-let modelSpeaking = false;
-
-// DOM
-const statusTextEl = document.getElementById("status-text");
-const systemStatusEl = document.getElementById("system-status");
-const audioStateTagEl = document.getElementById("audio-state-tag");
-const brandMarkEl = document.getElementById("brand-mark");
-
-const btnMic = document.getElementById("btn-mic");
-const btnCam = document.getElementById("btn-cam");
-const btnScreen = document.getElementById("btn-screen");
-const btnInterrupt = document.getElementById("btn-interrupt");
-
-const senseMicEl = document.getElementById("sense-mic");
-const senseCamEl = document.getElementById("sense-cam");
-const senseScreenEl = document.getElementById("sense-screen");
-
-const chatMessagesEl = document.getElementById("chat-messages");
-const chatInputEl = document.getElementById("chat-input");
-const sendBtnEl = document.getElementById("send-btn");
-
-const visBadgeEl = document.getElementById("vis-badge");
-
-const camImgEl = document.getElementById("webcam-img");
-const camPlaceholder = document.getElementById("cam-placeholder");
-const screenImgEl = document.getElementById("screen-img");
-const screenPlaceholder = document.getElementById("screen-placeholder");
-
-const modelSelectEl = document.getElementById("model-select");
-
-function populateModelList(models, activeId) {
-  modelSelectEl.innerHTML = "";
-  models.forEach((m) => {
-    const opt = document.createElement("option");
-    opt.value = m.id;
-    opt.textContent = m.label;
-    modelSelectEl.appendChild(opt);
-  });
-  modelSelectEl.value = activeId;
-}
-
-modelSelectEl.addEventListener("change", () => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "select_model", id: modelSelectEl.value }));
-  }
-});
-
-const activityFeedEl = document.getElementById("activity-feed");
-const activityEmptyEl = document.getElementById("activity-empty");
-const actBadgeEl = document.getElementById("act-badge");
-const pendingActivities = {};
 
 // Remote = served through Tailscale (HTTPS, non-localhost). Remote clients
 // play Ultron's voice in the browser; local ones rely on the Mac's speakers.
 const IS_REMOTE = !["127.0.0.1", "localhost", ""].includes(window.location.hostname);
+
+// ---------- DOM ----------
+
+const teleClockEl = document.getElementById("tele-clock");
+const teleCpuEl = document.getElementById("tele-cpu");
+const teleRamEl = document.getElementById("tele-ram");
+
+const orbStageEl = document.getElementById("orb-stage");
+const captionEl = document.getElementById("caption");
+
+const chatInputEl = document.getElementById("chat-input");
+const sendBtnEl = document.getElementById("send-btn");
+const commandPillEl = document.querySelector(".command-pill");
+
+const btnMic = document.getElementById("btn-mic");
+const btnCam = document.getElementById("btn-cam");
+const btnScreen = document.getElementById("btn-screen");
+
+const camVideoEl = document.getElementById("webcam-video");
+const camImgEl = document.getElementById("webcam-img");
+const camPlaceholder = document.getElementById("cam-placeholder");
+const camFeedCard = document.getElementById("cam-feed-card");
+const screenImgEl = document.getElementById("screen-img");
+const screenPlaceholder = document.getElementById("screen-placeholder");
+const screenFeedCard = document.getElementById("screen-feed-card");
+const pipStackEl = document.querySelector(".pip-stack");
+
+// ---------- Orb state machine ----------
+// Priority: offline > speaking > thinking > listening > idle.
+
+let lastAudioOutAt = 0;
+let speakingLevel = 0;      // envelope from the model's outgoing PCM
+let micLevel = 0;           // envelope from the local analyser
+let activeTools = 0;
+let connectionState = "connecting";   // connecting | online | offline
+let backendBusy = false;    // backend reported an executing/connecting status
+
+const SPEAK_HOLD_MS = 450;
+const MIC_GATE = 0.055;
+
+function resolveOrbState() {
+  if (connectionState === "offline") return "offline";
+  if (performance.now() - lastAudioOutAt < SPEAK_HOLD_MS) return "speaking";
+  if (activeTools > 0 || backendBusy) return "thinking";
+  if (!isMicMuted && micLevel > MIC_GATE) return "listening";
+  return "idle";
+}
+
+function pumpOrb() {
+  requestAnimationFrame(pumpOrb);
+  const orb = window.UltronOrb;
+  if (!orb) return;
+
+  // Mic envelope (RMS over the analyser bins), only meaningful while unmuted.
+  if (audioAnalyser && audioDataArray && !isMicMuted) {
+    audioAnalyser.getByteFrequencyData(audioDataArray);
+    let sum = 0;
+    for (let i = 0; i < audioDataArray.length; i++) {
+      const v = audioDataArray[i] / 255;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / audioDataArray.length);
+    micLevel += (rms - micLevel) * 0.25;
+  } else {
+    micLevel *= 0.85;
+  }
+
+  speakingLevel *= 0.90;
+
+  const state = resolveOrbState();
+  orb.setState(state);
+
+  if (state === "speaking") orb.setLevel(Math.min(1, speakingLevel * 2.2));
+  else if (state === "listening") orb.setLevel(Math.min(1, micLevel * 1.8));
+  else if (state === "thinking") orb.setLevel(0.12 + Math.abs(Math.sin(performance.now() / 520)) * 0.20);
+  else orb.setLevel(micLevel * 0.6);
+}
+
+/** RMS of a base64 PCM16 chunk, sampled sparsely — cheap enough per chunk. */
+function pcmRms(b64) {
+  try {
+    const raw = window.atob(b64);
+    const n = (raw.length / 2) | 0;
+    if (!n) return 0;
+    const step = Math.max(1, Math.floor(n / 128));
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < n; i += step) {
+      let s = raw.charCodeAt(i * 2) | (raw.charCodeAt(i * 2 + 1) << 8);
+      if (s > 32767) s -= 65536;
+      const v = s / 32768;
+      sum += v * v;
+      count++;
+    }
+    return Math.sqrt(sum / count);
+  } catch (_) {
+    return 0;
+  }
+}
+
+// ---------- Telemetry ----------
+
+function tickClock() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  teleClockEl.textContent = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function applyTelemetry(msg) {
+  if (typeof msg.cpu === "number") {
+    teleCpuEl.textContent = `CPU ${Math.round(msg.cpu)}%`;
+    teleCpuEl.classList.toggle("warm", msg.cpu >= 80);
+  }
+  if (typeof msg.mem_used_gb === "number" && typeof msg.mem_total_gb === "number") {
+    teleRamEl.textContent = `RAM ${msg.mem_used_gb.toFixed(1)}/${Math.round(msg.mem_total_gb)} GB`;
+    teleRamEl.classList.toggle("warm", msg.mem_used_gb / msg.mem_total_gb >= 0.9);
+  }
+}
+
+// ---------- Caption ----------
+
+let captionTimer = null;
+
+function showCaption(text, kind = "ultron") {
+  if (!text) return;
+  clearTimeout(captionTimer);
+  captionEl.textContent = text;
+  captionEl.className = `caption show ${kind}`;
+  const dwell = Math.min(14000, 3200 + text.length * 55);
+  captionTimer = setTimeout(() => captionEl.classList.remove("show"), dwell);
+}
 
 // ---------- WebSocket ----------
 
@@ -81,7 +167,8 @@ function initWebSocket() {
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
-    updateStatus("Listening");
+    connectionState = "online";
+    backendBusy = false;
     ws.send(JSON.stringify({ type: "client_hello", remote: IS_REMOTE }));
     initMicrophone();
   };
@@ -95,7 +182,9 @@ function initWebSocket() {
   };
 
   ws.onclose = () => {
-    updateStatus("Disconnected");
+    connectionState = "offline";
+    backendBusy = false;
+    activeTools = 0;
     setTimeout(initWebSocket, 3000);
   };
 }
@@ -107,10 +196,12 @@ function handleServerMessage(msg) {
       break;
 
     case "audio_out":
-      modelSpeaking = true;
-      audioStateTagEl.textContent = "Speaking";
-      brandMarkEl.classList.add("speaking");
-      if (IS_REMOTE && msg.pcm_base64) playPcmChunk(msg.pcm_base64);
+      lastAudioOutAt = performance.now();
+      backendBusy = false;
+      if (msg.pcm_base64) {
+        speakingLevel = Math.max(speakingLevel, pcmRms(msg.pcm_base64));
+        if (IS_REMOTE) playPcmChunk(msg.pcm_base64);
+      }
       break;
 
     case "exec_approval_request":
@@ -122,21 +213,18 @@ function handleServerMessage(msg) {
       break;
 
     case "chat_log":
-      addChatMessage(msg.sender, msg.text, msg.style);
+      // System log lines stay out of the UI — the orb carries system state.
+      if (msg.style === "system") console.info("[Ultron]", msg.text);
+      else showCaption(msg.text, msg.style === "user" ? "user" : "ultron");
       break;
 
     case "sve_workspace":
     case "sve_scene_create":
     case "sve_scene_update":
-    case "sve_scene_delete": {
-      const wantsAttention = window.SVE && window.SVE.handleEvent(msg);
-      if (wantsAttention && !document.getElementById("tab-vis").classList.contains("active")) {
-        visBadgeEl.classList.add("active");
-      }
-      if (msg.type === "sve_scene_create") switchTab("vis");
+    case "sve_scene_delete":
+      window.SVE?.handleEvent(msg);
       syncGesturesToWorkspace();
       break;
-    }
 
     case "camera_frame":
       // Backend JPEG frames feed Gemini; preview uses the local 30fps
@@ -157,60 +245,84 @@ function handleServerMessage(msg) {
       break;
 
     case "sense_update":
-      updateSenseBadges(msg.camera_active, msg.screen_active);
+      updateSenseState(msg.camera_active, msg.screen_active);
       break;
 
     case "tool_activity":
-      addToolActivity(msg);
+      if (msg.phase === "start") activeTools++;
+      else if (msg.phase === "done") activeTools = Math.max(0, activeTools - 1);
       break;
 
-    case "model_list":
-      populateModelList(msg.models, msg.active_id);
-      break;
-
-    case "model_changed":
-      if (modelSelectEl.value !== msg.id) modelSelectEl.value = msg.id;
-      addChatMessage("System", `Model switched to ${msg.label}` +
-        (msg.model_type === "local" ? " — text chat mode (voice needs Gemini Live)." : "."), "system");
+    case "system_telemetry":
+      applyTelemetry(msg);
       break;
 
     case "interrupted":
-      modelSpeaking = false;
-      audioStateTagEl.textContent = "Interrupted";
-      brandMarkEl.classList.remove("speaking");
+      lastAudioOutAt = 0;
+      speakingLevel = 0;
       flushPlayback();
       break;
   }
 }
 
-// ---------- Status ----------
-
 function updateStatus(status) {
-  statusTextEl.textContent = status;
-  const s = status.toLowerCase();
-
-  systemStatusEl.classList.remove("listening", "speaking", "executing", "error");
-
-  if (s.includes("speaking")) {
-    modelSpeaking = true;
-    audioStateTagEl.textContent = "Speaking";
-    brandMarkEl.classList.add("speaking");
-    systemStatusEl.classList.add("speaking");
-  } else if (s.includes("listening")) {
-    modelSpeaking = false;
-    audioStateTagEl.textContent = "Listening";
-    brandMarkEl.classList.remove("speaking");
-    systemStatusEl.classList.add("listening");
-  } else if (s.includes("executing")) {
-    audioStateTagEl.textContent = "Working";
-    systemStatusEl.classList.add("executing");
-  } else if (s.includes("error") || s.includes("failed") || s.includes("disconnected")) {
-    systemStatusEl.classList.add("error");
+  const s = (status || "").toLowerCase();
+  if (s.includes("error") || s.includes("failed") || s.includes("disconnected") || s.includes("shutting")) {
+    connectionState = "offline";
+    backendBusy = false;
+  } else {
+    connectionState = "online";
+    backendBusy = s.includes("executing") || s.includes("connecting") || s.includes("resuming");
+  }
+  if (s.includes("interrupted")) {
+    lastAudioOutAt = 0;
+    speakingLevel = 0;
   }
 }
 
-// Shared, refcounted webcam stream: live preview + gesture tracker use one
-// getUserMedia stream (30fps) instead of the backend's 0.8s JPEG feed.
+// ---------- Spatial layout ----------
+
+let spatialActive = false;
+let resizePump = null;
+
+/** Keep both WebGL renderers correct while the 600ms layout transition runs. */
+function pumpRenderers(durationMs = 720) {
+  cancelAnimationFrame(resizePump);
+  const until = performance.now() + durationMs;
+  const step = () => {
+    window.UltronOrb?.resize();
+    window.SVE?.resize?.();
+    if (performance.now() < until) resizePump = requestAnimationFrame(step);
+  };
+  step();
+}
+
+function setSpatialMode(active) {
+  if (active === spatialActive) return;
+  spatialActive = active;
+  document.body.classList.toggle("spatial-active", active);
+  pumpRenderers();
+}
+
+function syncSpatialMode() {
+  setSpatialMode(!!window.SVE?.hasActiveScene());
+}
+
+// Feed stack height feeds the rail layout so the command pill never rides
+// over the PIPs, whatever combination of feeds is live.
+if (pipStackEl) {
+  new ResizeObserver(() => {
+    const h = pipStackEl.getBoundingClientRect().height;
+    document.documentElement.style.setProperty("--pip-stack-h", `${Math.round(h)}px`);
+  }).observe(pipStackEl);
+}
+
+window.addEventListener("resize", () => pumpRenderers(120));
+
+// ---------- Shared webcam stream ----------
+// Live preview and the gesture tracker share one refcounted getUserMedia
+// stream (30fps) instead of the backend's 0.8s JPEG feed.
+
 let remoteCamFacing = "environment"; // phone default: rear camera (show surroundings)
 
 const UltronCamera = {
@@ -248,18 +360,12 @@ const UltronCamera = {
 };
 window.UltronCamera = UltronCamera;
 
-const camVideoEl = document.getElementById("webcam-video");
-const camFeedCard = document.getElementById("cam-feed-card");
-const screenFeedCard = document.getElementById("screen-feed-card");
-const camFeedLabel = document.getElementById("cam-feed-label");
 let previewOn = false;
 
-// Feed cards render only while their source is live.
+// PIP tiles render only while their source is live.
 function updateFeedCards() {
   const gestures = window.UltronGestures?.running;
-  const camLive = previewOn || isCamActive || gestures;
-  camFeedCard.style.display = camLive ? "" : "none";
-  camFeedLabel.textContent = gestures ? "Camera · hand tracking" : "Camera";
+  camFeedCard.style.display = (previewOn || isCamActive || gestures) ? "" : "none";
   screenFeedCard.style.display = isScreenActive ? "" : "none";
 }
 
@@ -293,13 +399,11 @@ function stopLocalPreview() {
   UltronCamera.release();
 }
 
-function updateSenseBadges(camActive, screenActive) {
+function updateSenseState(camActive, screenActive) {
   isCamActive = camActive;
   isScreenActive = screenActive;
 
-  senseCamEl.classList.toggle("active", camActive);
-  btnCam.classList.toggle("active", camActive);
-  btnCam.querySelector(".btn-lbl").textContent = camActive ? "Camera on" : "Camera";
+  setDockState(btnCam, camActive);
   if (camActive) {
     startLocalPreview();
     if (IS_REMOTE) startRemoteCamPush();
@@ -311,15 +415,14 @@ function updateSenseBadges(camActive, screenActive) {
       camPlaceholder.style.display = "block";
     }
   }
-  updateFeedCards();
 
-  senseScreenEl.classList.toggle("active", screenActive);
-  btnScreen.classList.toggle("active", screenActive);
-  btnScreen.querySelector(".btn-lbl").textContent = screenActive ? "Screen on" : "Screen";
+  setDockState(btnScreen, screenActive);
   if (!screenActive) {
     screenImgEl.style.display = "none";
     screenPlaceholder.style.display = "block";
   }
+
+  updateFeedCards();
 }
 
 // ---------- Phone camera push (remote sessions) ----------
@@ -370,7 +473,7 @@ if (IS_REMOTE && camFlipBtn) {
   });
 }
 
-// ---------- Microphone ----------
+// ---------- Microphone (16 kHz PCM16 → hub → Gemini Live) ----------
 
 async function initMicrophone() {
   try {
@@ -413,7 +516,7 @@ async function initMicrophone() {
       }));
     };
   } catch (err) {
-    addChatMessage("System", "Microphone access error: " + err.message, "system");
+    showCaption("Microphone access error: " + err.message, "user");
   }
 }
 
@@ -515,20 +618,23 @@ function respondExecApproval(approved) {
       approved: approved
     }));
   }
-  addChatMessage("System", (approved ? "Approved" : "Denied") + " remote command.", "system");
+  showCaption((approved ? "Approved" : "Denied") + " remote command.", "user");
   closeExecApproval(currentApprovalId);
 }
 
 document.getElementById("exec-approve").addEventListener("click", () => respondExecApproval(true));
 document.getElementById("exec-deny").addEventListener("click", () => respondExecApproval(false));
 
-// ---------- Controls ----------
+// ---------- Sensor dock ----------
+
+function setDockState(btn, on) {
+  btn.classList.toggle("active", on);
+  btn.setAttribute("aria-pressed", String(on));
+}
 
 btnMic.addEventListener("click", () => {
   isMicMuted = !isMicMuted;
-  btnMic.classList.toggle("active", !isMicMuted);
-  btnMic.querySelector(".btn-lbl").textContent = isMicMuted ? "Mic off" : "Mic on";
-  senseMicEl.classList.toggle("active", !isMicMuted);
+  setDockState(btnMic, !isMicMuted);
 });
 
 btnCam.addEventListener("click", () => {
@@ -543,41 +649,25 @@ btnScreen.addEventListener("click", () => {
   }
 });
 
-btnInterrupt.addEventListener("click", () => {
+// Tapping the orb is the barge-in gesture — it replaces the old Stop button.
+orbStageEl.addEventListener("click", () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "interrupt" }));
-    modelSpeaking = false;
-    audioStateTagEl.textContent = "Interrupted";
-    brandMarkEl.classList.remove("speaking");
   }
+  lastAudioOutAt = 0;
+  speakingLevel = 0;
+  flushPlayback();
 });
 
-// ---------- Chat ----------
-
-function addChatMessage(sender, text, style = "ultron") {
-  const msgDiv = document.createElement("div");
-  msgDiv.className = `msg-bubble ${style || (sender === "You" ? "user" : "ultron")}`;
-
-  if (style === "system") {
-    msgDiv.textContent = text;
-  } else {
-    msgDiv.textContent = text;
-  }
-
-  chatMessagesEl.appendChild(msgDiv);
-  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-function escapeHtml(str) {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+// ---------- Command line ----------
 
 function sendUserText() {
   const text = chatInputEl.value.trim();
   if (!text) return;
 
-  addChatMessage("You", text, "user");
+  showCaption(text, "user");
   chatInputEl.value = "";
+  commandPillEl.classList.remove("filled");
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "user_text", text: text }));
@@ -585,39 +675,23 @@ function sendUserText() {
 }
 
 sendBtnEl.addEventListener("click", sendUserText);
-chatInputEl.addEventListener("keypress", (e) => {
+chatInputEl.addEventListener("input", () => {
+  commandPillEl.classList.toggle("filled", chatInputEl.value.length > 0);
+});
+chatInputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendUserText();
+  if (e.key === "Escape") { chatInputEl.value = ""; commandPillEl.classList.remove("filled"); chatInputEl.blur(); }
 });
 
-// ---------- Tabs ----------
-
-function switchTab(tabName) {
-  ["chat", "vis", "act"].forEach((t) => {
-    document.getElementById(`tab-${t}-btn`).classList.toggle("active", tabName === t);
-    document.getElementById(`tab-${t}`).classList.toggle("active", tabName === t);
-  });
-
-  if (tabName === "vis") visBadgeEl.classList.remove("active");
-  if (tabName === "act") actBadgeEl.classList.remove("active");
-  syncGesturesToWorkspace();
-}
-
-// Hands-on by default whenever the Spatial tab is showing a live scene;
-// off (camera released) when leaving it or when the workspace empties.
-function syncGesturesToWorkspace() {
-  const g = window.UltronGestures;
-  if (!g || !window.SVE) return;
-  const spatialVisible = document.getElementById("tab-vis").classList.contains("active");
-  if (spatialVisible && window.SVE.hasActiveScene()) {
-    if (!g.running && !g.starting) g.start();
-  } else if (g.running) {
-    g.stop();
+// Type anywhere to summon the command line — no visible affordance needed.
+window.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (document.activeElement === chatInputEl) return;
+  if (document.activeElement && document.activeElement.tagName === "INPUT") return;
+  if (e.key.length === 1 && e.key !== " ") {
+    chatInputEl.focus();
   }
-}
-
-// Watchdog: recovers from transient start failures (permission just granted,
-// GPU delegate fallback, camera briefly busy) without user interaction.
-setInterval(syncGesturesToWorkspace, 5000);
+});
 
 // ---------- SVE bridge ----------
 
@@ -626,96 +700,33 @@ window.sveSend = (obj) => {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 };
 
-// ---------- Tool Activity ----------
+document.getElementById("btn-reset-view").addEventListener("click", () => window.SVE?.resetCamera());
 
-function addToolActivity(msg) {
-  if (activityEmptyEl) activityEmptyEl.style.display = "none";
+// Hands-on by default whenever a live scene is on stage; off (camera released)
+// when the workspace empties. Also drives the spatial layout toggle, since
+// sve.js calls this hook whenever the scene set changes.
+function syncGesturesToWorkspace() {
+  syncSpatialMode();
 
-  if (msg.phase === "start") {
-    const card = document.createElement("div");
-    card.className = "activity-card";
-    const time = new Date().toLocaleTimeString();
-    card.innerHTML = `
-      <div class="activity-head">
-        <span class="activity-name">${escapeHtml(msg.name)}</span>
-        <span class="activity-time">${time}</span>
-        <span class="activity-state">running</span>
-      </div>
-      <div class="activity-args">${escapeHtml(msg.args_preview || "")}</div>
-      <div class="activity-result"></div>`;
-    activityFeedEl.appendChild(card);
-    pendingActivities[msg.name] = card;
-  } else if (msg.phase === "done") {
-    const card = pendingActivities[msg.name];
-    if (card) {
-      card.classList.add("done");
-      card.querySelector(".activity-state").textContent = "done";
-      card.querySelector(".activity-result").textContent = msg.result_preview || "";
-      delete pendingActivities[msg.name];
-    }
-  }
-  activityFeedEl.scrollTop = activityFeedEl.scrollHeight;
-
-  if (!document.getElementById("tab-act").classList.contains("active")) {
-    actBadgeEl.classList.add("active");
+  const g = window.UltronGestures;
+  if (!g || !window.SVE) return;
+  if (spatialActive && window.SVE.hasActiveScene()) {
+    if (!g.running && !g.starting) g.start();
+  } else if (g.running) {
+    g.stop();
   }
 }
+window.syncGesturesToWorkspace = syncGesturesToWorkspace;
 
-// ---------- Waveform visualizer ----------
+// Watchdog: recovers from transient start failures (permission just granted,
+// GPU delegate fallback, camera briefly busy) without user interaction.
+setInterval(syncGesturesToWorkspace, 5000);
 
-function renderCanvasVisualizer() {
-  const canvas = document.getElementById("visualizer-canvas");
-  const ctx = canvas.getContext("2d");
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = canvas.offsetWidth * dpr;
-  canvas.height = canvas.offsetHeight * dpr;
-  ctx.scale(dpr, dpr);
-
-  const W = canvas.offsetWidth;
-  const H = canvas.offsetHeight;
-  const BARS = 36;
-  const gap = 3;
-  const barW = (W - gap * (BARS - 1)) / BARS;
-  let phase = 0;
-
-  const css = getComputedStyle(document.documentElement);
-  const accent = css.getPropertyValue("--accent").trim() || "#5b8def";
-  const green = css.getPropertyValue("--green").trim() || "#4cc38a";
-  const faint = css.getPropertyValue("--border").trim() || "#26292e";
-
-  function draw() {
-    requestAnimationFrame(draw);
-    ctx.clearRect(0, 0, W, H);
-    phase += 0.06;
-
-    let levels = new Array(BARS).fill(0);
-    if (modelSpeaking) {
-      for (let i = 0; i < BARS; i++) {
-        levels[i] = 0.35 + 0.55 * Math.abs(Math.sin(phase * 1.6 + i * 0.45)) * Math.abs(Math.sin(phase * 0.7 + i));
-      }
-    } else if (audioAnalyser && audioDataArray) {
-      audioAnalyser.getByteFrequencyData(audioDataArray);
-      for (let i = 0; i < BARS; i++) {
-        levels[i] = (audioDataArray[i % audioDataArray.length] / 255) * 0.9;
-      }
-    }
-
-    const color = modelSpeaking ? green : accent;
-    for (let i = 0; i < BARS; i++) {
-      const h = Math.max(3, levels[i] * (H - 10));
-      const x = i * (barW + gap);
-      const y = (H - h) / 2;
-      ctx.fillStyle = levels[i] > 0.02 ? color : faint;
-      ctx.beginPath();
-      ctx.roundRect(x, y, barW, h, barW / 2);
-      ctx.fill();
-    }
-  }
-
-  draw();
-}
+// ---------- Boot ----------
 
 window.addEventListener("DOMContentLoaded", () => {
-  renderCanvasVisualizer();
+  tickClock();
+  setInterval(tickClock, 1000);
+  requestAnimationFrame(pumpOrb);
   initWebSocket();
 });

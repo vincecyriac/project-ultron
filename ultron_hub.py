@@ -19,6 +19,10 @@ import termios
 import ssl
 import base64
 import websockets
+try:
+    import psutil
+except ImportError:          # telemetry degrades to clock-only in the GUI
+    psutil = None
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -115,6 +119,53 @@ def set_system_status(status_str: str):
     broadcast_event({"type": "status", "status": status_str})
 
 
+# ---------- Ambient system telemetry (drives the GUI's top-left HUD) ----------
+
+TELEMETRY_INTERVAL = 2.0
+
+_last_cpu = {"value": 0.0, "at": 0.0}
+
+def sample_telemetry() -> dict | None:
+    """CPU load + physical memory use. None when psutil is unavailable."""
+    if psutil is None:
+        return None
+    try:
+        # cpu_percent(interval=None) measures since its own previous call, so
+        # two calls in quick succession make the second read ~0. Reuse the last
+        # reading unless enough time has passed for a meaningful sample.
+        now = time.time()
+        if now - _last_cpu["at"] >= 0.5:
+            _last_cpu["value"] = psutil.cpu_percent(interval=None)
+            _last_cpu["at"] = now
+        vm = psutil.virtual_memory()
+        return {
+            "type": "system_telemetry",
+            "cpu": _last_cpu["value"],
+            "mem_used_gb": (vm.total - vm.available) / (1024 ** 3),
+            "mem_total_gb": vm.total / (1024 ** 3),
+        }
+    except Exception:
+        return None
+
+
+async def telemetry_task():
+    """Push a light system snapshot to every connected GUI on an interval."""
+    if psutil is None:
+        log_info("psutil not installed — GUI telemetry limited to the clock.")
+        return
+    # cpu_percent's very first call always returns 0.0; prime it, take one real
+    # reading into the cache, then settle into the broadcast interval.
+    psutil.cpu_percent(interval=None)
+    await asyncio.sleep(0.5)
+    _last_cpu["value"] = psutil.cpu_percent(interval=None)
+    _last_cpu["at"] = time.time()
+    while not shutdown_event.is_set():
+        payload = sample_telemetry()
+        if payload:
+            broadcast_event(payload)
+        await asyncio.sleep(TELEMETRY_INTERVAL)
+
+
 def remote_frame_fresh() -> bool:
     return latest_remote_frame_bytes is not None and (time.time() - latest_remote_frame_ts) < 5.0
 
@@ -188,6 +239,9 @@ async def ws_handler(websocket):
         "models": get_model_registry(),
         "active_id": active_model["id"]
     }))
+    telemetry = sample_telemetry()
+    if telemetry:
+        await websocket.send(json.dumps(telemetry))
     await websocket.send(json.dumps(sentry_scene.manager.workspace_snapshot()))
     try:
         async for message in websocket:
@@ -1280,6 +1334,7 @@ async def run_ultron():
     ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
     log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
     playback_task = asyncio.create_task(play_audio_worker(output_stream))
+    telemetry_worker = asyncio.create_task(telemetry_task())
 
     # Load local persistent memory
     memory = load_memory()
@@ -1350,33 +1405,39 @@ async def run_ultron():
                 "tools": [
                     {"google_search": {}},
                     {"function_declarations": TOOL_FUNCTION_DECLARATIONS}
-                ]
+                ],
+                # No "transparent": that flag is Vertex / Agent Platform only, and
+                # the Developer API refuses the whole connection when it is set.
+                # Sent on every connect (handle=None just starts a fresh
+                # resumable session) to match the documented contract that this
+                # config is what asks the server for SessionResumptionUpdates.
+                "session_resumption": {"handle": previous_handle},
             }
-            
+
             if previous_handle:
                 log_info("Resuming previous session handle...")
-                config_dict["session_resumption"] = {
-                    "handle": previous_handle,
-                    "transparent": True
-                }
 
             live_config = types.LiveConnectConfig(**config_dict)
 
             set_system_status("Connecting to API" if not previous_handle else "Resuming API Session")
             log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": previous_handle is not None})
             
+            session_established = False
             try:
                 async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
+                    session_established = True
                     set_system_status("Listening")
                     log_interaction("connection_success", {"resumed": previous_handle is not None})
                     consecutive_failures = 0
-                    
+
                     await run_session_tasks(session, input_stream)
-                        
+
             except Exception as e:
                 consecutive_failures += 1
-                log_interaction("connection_error", {"error": str(e)})
-                if previous_handle:
+                log_interaction("connection_error", {"error": str(e), "established": session_established})
+                if previous_handle and not session_established:
+                    # The handshake itself was refused while resuming, so the
+                    # stored handle is stale/invalid — drop it and start clean.
                     log_info(f"Session resumption failed ({e}). Clearing handle and starting fresh...")
                     if os.path.exists(SESSION_HANDLE_FILE):
                         try:
@@ -1385,6 +1446,9 @@ async def run_ultron():
                             pass
                     await asyncio.sleep(0.5)
                 else:
+                    # Either a cold-start failure or a live session that dropped.
+                    # A live session's handle is exactly what we need to resume,
+                    # so it is deliberately left on disk.
                     set_system_status("Connection Failed")
                     log_info(f"Live API error: {e}")
                     backoff = min(10, 2 ** min(consecutive_failures, 3))
@@ -1404,6 +1468,7 @@ async def run_ultron():
         except Exception:
             pass
         playback_task.cancel()
+        telemetry_worker.cancel()
         try:
             input_stream.stop_stream()
             input_stream.close()
