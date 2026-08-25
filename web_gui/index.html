@@ -2,159 +2,120 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Ultron — Personal Assistant</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Ultron</title>
   <link rel="stylesheet" href="style.css" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
 <body>
-  <div class="app">
 
-    <!-- Header -->
-    <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark" id="brand-mark"></div>
-        <span class="brand-name">Ultron</span>
-      </div>
-
-      <div class="status-chip" id="system-status">
-        <span class="status-dot"></span>
-        <span id="status-text">Connecting…</span>
-      </div>
-
-      <select id="model-select" class="model-select" title="Active model">
-        <option>Loading models…</option>
-      </select>
-
-      <div class="sense-chips">
-        <div class="chip active" id="sense-mic" title="Microphone">
-          <span class="chip-dot"></span><span class="sense-text">Mic</span>
-        </div>
-        <div class="chip" id="sense-cam" title="Camera">
-          <span class="chip-dot"></span><span class="sense-text">Camera</span>
-        </div>
-        <div class="chip" id="sense-screen" title="Screen">
-          <span class="chip-dot"></span><span class="sense-text">Screen</span>
-        </div>
-      </div>
-    </header>
-
-    <!-- Main -->
-    <main class="layout">
-
-      <!-- Sidebar -->
-      <aside class="sidebar">
-        <div class="card core-card">
-          <canvas id="visualizer-canvas" width="360" height="120"></canvas>
-          <div class="core-state" id="audio-state-tag">Idle</div>
-        </div>
-
-        <div class="card controls-card">
-          <button class="ctl active" id="btn-mic">
-            <span class="ctl-icon">🎙</span><span class="btn-lbl">Mic on</span>
-          </button>
-          <button class="ctl" id="btn-cam">
-            <span class="ctl-icon">📷</span><span class="btn-lbl">Camera</span>
-          </button>
-          <button class="ctl" id="btn-screen">
-            <span class="ctl-icon">🖥</span><span class="btn-lbl">Screen</span>
-          </button>
-          <button class="ctl stop" id="btn-interrupt">
-            <span class="ctl-icon">■</span><span class="btn-lbl">Stop</span>
-          </button>
-        </div>
-
-        <div class="card feed-card" id="cam-feed-card" style="display:none;">
-          <div class="feed-head">
-            <div class="feed-label" id="cam-feed-label">Camera</div>
-            <button class="ghost-btn" id="btn-cam-flip" style="display:none;" title="Switch front/rear camera">🔄 Flip</button>
-          </div>
-          <div class="feed-body">
-            <video id="webcam-video" autoplay playsinline muted style="display:none;"></video>
-            <img id="webcam-img" style="display:none;" />
-            <canvas id="cam-overlay"></canvas>
-            <span class="feed-off" id="cam-placeholder">Off</span>
-          </div>
-        </div>
-
-        <div class="card feed-card" id="screen-feed-card" style="display:none;">
-          <div class="feed-label">Screen</div>
-          <div class="feed-body">
-            <img id="screen-img" style="display:none;" />
-            <span class="feed-off" id="screen-placeholder">Off</span>
-          </div>
-        </div>
-      </aside>
-
-      <!-- Content -->
-      <section class="content card">
-        <nav class="tabs">
-          <button class="tab active" id="tab-chat-btn" onclick="switchTab('chat')">Chat</button>
-          <button class="tab" id="tab-vis-btn" onclick="switchTab('vis')">
-            Spatial<span class="tab-badge" id="vis-badge"></span>
-          </button>
-          <button class="tab" id="tab-act-btn" onclick="switchTab('act')">
-            Activity<span class="tab-badge" id="act-badge"></span>
-          </button>
-        </nav>
-
-        <!-- Chat -->
-        <div class="tab-view active" id="tab-chat">
-          <div class="chat-scroll" id="chat-messages">
-            <div class="chat-welcome">
-              <p>Hi Vince — talk to me over the mic, or type below.</p>
-            </div>
-          </div>
-          <div class="chat-inputbar">
-            <input type="text" id="chat-input" placeholder="Message Ultron…" autocomplete="off" />
-            <button id="send-btn" title="Send">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="22" y1="2" x2="11" y2="13"></line>
-                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        <!-- Spatial workspace (SVE) -->
-        <div class="tab-view" id="tab-vis">
-          <div class="vis-toolbar">
-            <div class="sve-scene-tabs" id="sve-scene-tabs"></div>
-            <div class="vis-actions">
-              <button class="ghost-btn" id="btn-hands" title="Hand gesture control (webcam)">✋ Hands</button>
-              <button class="ghost-btn" onclick="window.SVE && SVE.resetCamera()">Reset view</button>
-            </div>
-          </div>
-          <div class="sve-stage">
-            <div id="sve-viewport"></div>
-            <div class="gesture-cursor" id="gesture-cursor"></div>
-            <div class="gesture-hud" id="gesture-hud"></div>
-            <div class="sve-info" id="sve-info"></div>
-            <div class="empty-state" id="sve-empty">
-              <p>Ask Ultron to visualize anything — scenes render here as live 3D objects.
-              Drag to orbit, scroll to zoom, click objects to select, F to focus, Del to remove.</p>
-            </div>
-          </div>
-        </div>
-
-        <!-- Activity -->
-        <div class="tab-view" id="tab-act">
-          <div class="activity-feed" id="activity-feed">
-            <div class="empty-state" id="activity-empty">
-              <p>Every action — commands, clicks, web fetches, recognitions — shows up here live.</p>
-            </div>
-          </div>
-        </div>
-      </section>
-    </main>
+  <!-- Ambient telemetry — pinned top-left, never overlaps anything else -->
+  <div class="telemetry" id="telemetry">
+    <span class="tele-clock" id="tele-clock">--:--:--</span>
+    <span class="tele-sep">|</span>
+    <span class="tele-stat" id="tele-cpu">CPU&nbsp;--%</span>
+    <span class="tele-sep">|</span>
+    <span class="tele-stat" id="tele-ram">RAM&nbsp;--</span>
   </div>
 
-  <!-- Remote command approval (shown when a Tailscale session asks to run shell/AppleScript) -->
+  <!-- Background agents: one chip per running sub-agent, top-left under telemetry -->
+  <div class="agent-rail" id="agent-rail"></div>
+
+  <!-- Holographic Orb: dead-centre when idle, docks into the left rail in spatial mode -->
+  <div class="orb-stage" id="orb-stage" title="Tap to interrupt"></div>
+
+  <!-- Voice / text caption, auto-fading -->
+  <div class="caption-lane">
+    <div class="caption" id="caption"></div>
+  </div>
+
+  <!-- Ambient command line (ghosted until focused; start typing anywhere) -->
+  <div class="command-lane">
+    <div class="command-pill">
+      <input type="text" id="chat-input" placeholder="Speak, or type…" autocomplete="off" spellcheck="false" />
+      <button id="send-btn" title="Send">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Left-rail feeds: screen tile stacks above the mirrored camera PIP -->
+  <div class="pip-stack">
+    <div class="pip" id="screen-feed-card" style="display:none;">
+      <div class="pip-body">
+        <img id="screen-img" style="display:none;" />
+        <span class="pip-off" id="screen-placeholder">Screen</span>
+      </div>
+    </div>
+
+    <div class="pip mirrored" id="cam-feed-card" style="display:none;">
+      <div class="pip-body">
+        <video id="webcam-video" autoplay playsinline muted style="display:none;"></video>
+        <img id="webcam-img" style="display:none;" />
+        <canvas id="cam-overlay"></canvas>
+        <span class="pip-off" id="cam-placeholder">Camera</span>
+      </div>
+      <button class="pip-flip" id="btn-cam-flip" style="display:none;" title="Switch front/rear camera">⟳</button>
+    </div>
+  </div>
+
+  <!-- Widget deck: right-hand workspace, never overlaps the rail or camera PIP -->
+  <div class="workspace" id="workspace-container">
+    <div class="widget-deck" id="widget-deck"></div>
+  </div>
+
+  <!-- The 3D stage lives here while no 3d_spatial widget is mounted; app.js
+       moves this whole node into the widget card and back, so the WebGL
+       context and its ResizeObserver survive intact. -->
+  <div class="sve-parking" id="sve-parking" aria-hidden="true">
+    <div class="sve-stage" id="sve-stage">
+      <div id="sve-viewport"></div>
+      <div class="gesture-cursor" id="gesture-cursor"></div>
+      <div class="gesture-hud" id="gesture-hud"></div>
+      <div class="sve-info" id="sve-info"></div>
+      <div class="empty-state" id="sve-empty"></div>
+      <div class="sve-scene-tabs" id="sve-scene-tabs"></div>
+    </div>
+  </div>
+
+  <!-- Ultra-minimal sensor dock -->
+  <div class="dock">
+    <button class="dock-btn active" id="btn-mic" title="Microphone" aria-pressed="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+        <path d="M5 10v1a7 7 0 0 0 14 0v-1"></path>
+        <line x1="12" y1="18" x2="12" y2="22"></line>
+      </svg>
+      <span class="dock-slash"></span>
+    </button>
+
+    <button class="dock-btn" id="btn-cam" title="Camera" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 8.5v7a1 1 0 0 1-1.55.83L16 13.5v-3l4.45-2.83A1 1 0 0 1 22 8.5z"></path>
+        <rect x="2" y="6" width="14" height="12" rx="2.5"></rect>
+      </svg>
+      <span class="dock-slash"></span>
+    </button>
+
+    <button class="dock-btn" id="btn-screen" title="Screen" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="4" width="20" height="13" rx="2"></rect>
+        <line x1="8" y1="21" x2="16" y2="21"></line>
+        <line x1="12" y1="17" x2="12" y2="21"></line>
+      </svg>
+      <span class="dock-slash"></span>
+    </button>
+  </div>
+
+  <!-- Remote command approval (Tailscale sessions asking to run shell/AppleScript) -->
   <div class="exec-approval" id="exec-approval" style="display:none;">
     <div class="exec-approval-box">
-      <div class="exec-approval-title">⚠ Command approval required</div>
+      <div class="exec-approval-title">Command approval required</div>
       <div class="exec-approval-tool" id="exec-approval-tool">Shell command</div>
       <pre class="exec-approval-cmd" id="exec-approval-cmd"></pre>
       <div class="exec-approval-actions">
@@ -167,6 +128,7 @@
   <script type="importmap">
     { "imports": { "three": "./vendor/three.module.min.js" } }
   </script>
+  <script type="module" src="orb.js"></script>
   <script type="module" src="sve.js"></script>
   <script type="module" src="gestures.js"></script>
   <script src="app.js"></script>

@@ -16,9 +16,14 @@ import numpy as np
 import unicodedata
 import tty
 import termios
+import signal
 import ssl
 import base64
 import websockets
+try:
+    import psutil
+except ImportError:          # telemetry degrades to clock-only in the GUI
+    psutil = None
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -29,9 +34,9 @@ import sentry_exec
 import sentry_action
 import sentry_recognition
 import sentry_web
-import sentry_local
 import sentry_personal
 import sentry_scene
+import ultron_agents
 
 # Load environment variables
 load_dotenv()
@@ -43,23 +48,16 @@ except AttributeError:
     pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SESSION_HANDLE_FILE = os.path.join(BASE_DIR, ".session_handle.json")
 HISTORY_LOG_FILE = os.path.join(BASE_DIR, "ultron_history.jsonl")
 MEMORY_FILE = os.path.join(BASE_DIR, "ultron_memory.json")
 
 # Model selection: defaults to gemini-3.1-flash-live-preview, customizable via env
 MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
 
+# Deep, grounded assistant persona. Charon / Kore both suit it; Puck is lighter.
+LIVE_VOICE = os.getenv("ULTRON_VOICE", "Charon")
+
 # Local models served by LM Studio (OpenAI-compatible API)
-LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
-LOCAL_MODELS = [m.strip() for m in os.getenv("LOCAL_MODELS", "").split(",") if m.strip()]
-
-def get_model_registry() -> list:
-    models = [{"id": MODEL_ID, "type": "gemini", "label": f"Gemini Live · {MODEL_ID}"}]
-    for m in LOCAL_MODELS:
-        models.append({"id": m, "type": "local", "label": f"Local · {m}"})
-    return models
-
 # Audio configuration
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
@@ -83,6 +81,7 @@ input_buffer = ""
 mic_audio_buffer = bytearray()
 MAX_BUFFER_SIZE = 320000  # 10 seconds of 16kHz 16-bit PCM (voice enrollment window)
 model_is_speaking = False
+model_turn_active = False      # Live is mid-response (audio, text or tool call)
 connected_ws_clients = set()
 remote_ws_clients = set()  # clients reached via Tailscale Serve (phone, other devices)
 pending_exec_approvals = {}  # approval_id -> asyncio.Future[bool]
@@ -90,13 +89,88 @@ latest_remote_frame_bytes = None  # last camera frame pushed by a remote client
 latest_remote_frame_ts = 0.0
 camera_source = {"mode": "auto"}  # auto = phone camera when remote session live; mac = force Mac webcam
 global_live_session = None
-active_model = {"type": "gemini", "id": MODEL_ID}
-local_client = None
 system_prompt_text = ""
 last_focus_note = ""
 
-def gemini_mode() -> bool:
-    return active_model["type"] == "gemini"
+# Live session resumption.
+#
+# A resumption handle restores the ENTIRE prior conversation, so it must never
+# outlive the process: reopening the app would silently continue whatever was
+# discussed before (and re-fire that turn's tool calls). It is therefore kept in
+# memory only, purely to bridge GoAway rotations and transient drops *within one
+# run*. A new process is always a new conversation.
+#
+# Persisting it to disk was tried and cannot be made safe here: run_ultron()
+# executes in a daemon thread (app_desktop.py), so its finally: block never runs
+# on quit — nothing can reliably delete the file — and any age-based "crash
+# recovery" window is exactly the window in which a person quits and reopens.
+current_session_handle = None
+
+# ---------- Lifecycle control ----------
+# run_ultron() runs on its own loop, usually inside a thread owned by a GUI
+# shell, so shutdown can be requested from the window, a signal handler, or the
+# assistant itself. Everything funnels through request_shutdown().
+
+main_loop = None                 # the loop run_ultron() is running on
+genai_client = None              # kept alive until interpreter exit (see run_ultron)
+shutdown_callbacks = []          # notified once, when shutdown begins
+_shutdown_reason = ""
+
+
+class StartupError(RuntimeError):
+    """Fatal boot failure. The shell reports it and exits — never sys.exit()
+    from here, which would only kill the engine thread and leave a dead app."""
+
+
+def on_shutdown(callback):
+    """Register a callable(reason) fired when the engine starts shutting down."""
+    shutdown_callbacks.append(callback)
+
+
+def request_shutdown(reason: str = ""):
+    """Begin a graceful shutdown. Safe to call from any thread."""
+    global _shutdown_reason
+    if shutdown_event.is_set():
+        return
+    _shutdown_reason = reason or _shutdown_reason
+    log_info(f"Shutdown requested ({_shutdown_reason or 'no reason given'}).")
+    loop = main_loop
+    if loop is not None and loop.is_running():
+        loop.call_soon_threadsafe(shutdown_event.set)
+    else:
+        shutdown_event.set()
+
+
+async def sleep_unless_shutdown(seconds: float) -> bool:
+    """Sleep, but wake immediately if shutdown is requested.
+    Returns True if it slept the full duration."""
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=seconds)
+        return False
+    except asyncio.TimeoutError:
+        return True
+
+
+async def shutdown_watcher():
+    """Fires the registered callbacks so a GUI shell can close its window when
+    the assistant decides to quit on its own (e.g. the shutdown_ultron tool)."""
+    await shutdown_event.wait()
+    for cb in list(shutdown_callbacks):
+        try:
+            cb(_shutdown_reason)
+        except Exception as e:
+            log_info(f"Shutdown callback failed: {e}")
+
+
+def save_session_handle(handle: str):
+    global current_session_handle
+    current_session_handle = handle
+
+
+def clear_session_handle():
+    global current_session_handle
+    current_session_handle = None
+
 
 sentry_scene.set_broadcaster(lambda ev: broadcast_event(ev))
 
@@ -115,6 +189,69 @@ def set_system_status(status_str: str):
     broadcast_event({"type": "status", "status": status_str})
 
 
+# ---------- Ambient system telemetry (drives the GUI's top-left HUD) ----------
+
+TELEMETRY_INTERVAL = 2.0
+
+_last_cpu = {"value": 0.0, "at": 0.0, "cores": []}
+_last_net = {"io": None, "at": 0.0}
+
+def sample_telemetry() -> dict | None:
+    """CPU load + physical memory use. None when psutil is unavailable."""
+    if psutil is None:
+        return None
+    try:
+        # cpu_percent(interval=None) measures since its own previous call, so
+        # two calls in quick succession make the second read ~0. Reuse the last
+        # reading unless enough time has passed for a meaningful sample.
+        now = time.time()
+        if now - _last_cpu["at"] >= 0.5:
+            _last_cpu["value"] = psutil.cpu_percent(interval=None)
+            _last_cpu["cores"] = psutil.cpu_percent(interval=None, percpu=True)
+            _last_cpu["at"] = now
+        vm = psutil.virtual_memory()
+        payload = {
+            "type": "system_telemetry",
+            "cpu": _last_cpu["value"],
+            "mem_used_gb": (vm.total - vm.available) / (1024 ** 3),
+            "mem_total_gb": vm.total / (1024 ** 3),
+        }
+        # Extras for the telemetry widget; the HUD ignores what it does not use.
+        try:
+            payload["cpu_cores"] = _last_cpu.get("cores") or []
+            io = psutil.net_io_counters()
+            prev, prev_t = _last_net["io"], _last_net["at"]
+            if prev is not None and now > prev_t:
+                span = now - prev_t
+                payload["net_up_kbps"] = max(0.0, (io.bytes_sent - prev.bytes_sent) / span / 1024)
+                payload["net_down_kbps"] = max(0.0, (io.bytes_recv - prev.bytes_recv) / span / 1024)
+            _last_net["io"], _last_net["at"] = io, now
+            payload["uptime_s"] = max(0.0, time.time() - psutil.boot_time())
+        except Exception:
+            pass
+        return payload
+    except Exception:
+        return None
+
+
+async def telemetry_task():
+    """Push a light system snapshot to every connected GUI on an interval."""
+    if psutil is None:
+        log_info("psutil not installed — GUI telemetry limited to the clock.")
+        return
+    # cpu_percent's very first call always returns 0.0; prime it, take one real
+    # reading into the cache, then settle into the broadcast interval.
+    psutil.cpu_percent(interval=None)
+    await asyncio.sleep(0.5)
+    _last_cpu["value"] = psutil.cpu_percent(interval=None)
+    _last_cpu["at"] = time.time()
+    while not shutdown_event.is_set():
+        payload = sample_telemetry()
+        if payload:
+            broadcast_event(payload)
+        await asyncio.sleep(TELEMETRY_INTERVAL)
+
+
 def remote_frame_fresh() -> bool:
     return latest_remote_frame_bytes is not None and (time.time() - latest_remote_frame_ts) < 5.0
 
@@ -123,7 +260,7 @@ def remote_session_active() -> bool:
 
 async def notify_session_remote_change(connected: bool):
     """Tells the live model which device Vince is on, so senses default correctly."""
-    if not (gemini_mode() and global_live_session):
+    if not global_live_session:
         return
     if connected:
         note = ("[System note, do not respond: Vince just connected remotely from his phone. "
@@ -183,12 +320,11 @@ async def ws_handler(websocket):
         "camera_active": camera_stream_active,
         "screen_active": screen_stream_active
     }))
-    await websocket.send(json.dumps({
-        "type": "model_list",
-        "models": get_model_registry(),
-        "active_id": active_model["id"]
-    }))
+    telemetry = sample_telemetry()
+    if telemetry:
+        await websocket.send(json.dumps(telemetry))
     await websocket.send(json.dumps(sentry_scene.manager.workspace_snapshot()))
+    await websocket.send(json.dumps(widget_snapshot()))
     try:
         async for message in websocket:
             try:
@@ -208,7 +344,7 @@ async def ws_handler(websocket):
                         latest_remote_frame_bytes = base64.b64decode(b64)
                         latest_remote_frame_ts = time.time()
                         if camera_stream_active and camera_source["mode"] != "mac" \
-                                and gemini_mode() and global_live_session:
+                                and global_live_session:
                             await global_live_session.send_realtime_input(
                                 video=types.Blob(data=latest_remote_frame_bytes, mime_type="image/jpeg")
                             )
@@ -223,16 +359,13 @@ async def ws_handler(websocket):
                         mic_audio_buffer.extend(pcm_bytes)
                         if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
                             mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
-                        if gemini_mode() and global_live_session:
+                        if global_live_session:
                             await global_live_session.send_realtime_input(
                                 audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
                             )
                 elif msg_type == "user_text":
                     text = data.get("text")
-                    if text and not gemini_mode():
-                        log_info(f"GUI Chat (local): {text[:40]}...")
-                        asyncio.create_task(handle_local_chat(text))
-                    elif text and global_live_session:
+                    if text and global_live_session:
                         log_info(f"GUI Chat: {text[:40]}...")
                         await global_live_session.send_client_content(
                             turns=[{"role": "user", "parts": [{"text": text}]}],
@@ -248,7 +381,7 @@ async def ws_handler(websocket):
                     if data.get("action") in ("select", "point_at") and data.get("object_id"):
                         global last_focus_note
                         note = sentry_scene.manager.focus_context()
-                        if note and note != last_focus_note and gemini_mode() and global_live_session:
+                        if note and note != last_focus_note and global_live_session:
                             last_focus_note = note
                             try:
                                 await global_live_session.send_client_content(
@@ -259,22 +392,16 @@ async def ws_handler(websocket):
                                 )
                             except Exception:
                                 pass
-                elif msg_type == "select_model":
-                    mid = data.get("id")
-                    entry = next((m for m in get_model_registry() if m["id"] == mid), None)
-                    if entry:
-                        active_model["type"] = entry["type"]
-                        active_model["id"] = entry["id"]
-                        broadcast_event({
-                            "type": "model_changed",
-                            "id": entry["id"],
-                            "model_type": entry["type"],
-                            "label": entry["label"]
-                        })
-                        if entry["type"] == "local":
-                            log_info(f"Switched to local model: {entry['id']} (text chat; voice stays with Gemini Live).")
-                        else:
-                            log_info(f"Switched to Gemini Live: {entry['id']}.")
+                elif msg_type == "widget_user_action":
+                    # The user clicked a card's X, or the GUI mounted the 3D
+                    # card itself. Keep the hub's deck in step, and let the
+                    # model know so it does not talk about a dismissed widget.
+                    tool = data.get("tool")
+                    wargs = data.get("args") or {}
+                    if tool in ("create_widget", "update_widget",
+                                "dismiss_widget", "clear_all_widgets"):
+                        out, _ = await execute_tool(tool, wargs)
+                        log_info(f"GUI widget action: {tool} -> {str(out)[:60]}")
                 elif msg_type == "toggle_camera":
                     camera_stream_active = data.get("active", False)
                     broadcast_event({
@@ -415,7 +542,7 @@ async def send_audio_task(session, input_stream, session_disconnect_event):
                     mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
                 
                 # Only send PyAudio mic data to Gemini if NO WebSocket GUI client is connected
-                if not model_is_speaking and not connected_ws_clients and gemini_mode():
+                if not model_is_speaking and not connected_ws_clients:
                     await session.send_realtime_input(
                         audio=types.Blob(
                             data=data,
@@ -444,10 +571,9 @@ async def stream_senses_task(session, session_disconnect_event):
                     if screen_bytes:
                         b64 = base64.b64encode(screen_bytes).decode('utf-8')
                         broadcast_event({"type": "screen_frame", "image_base64": b64})
-                        if gemini_mode():
-                            await session.send_realtime_input(
-                                video=types.Blob(data=screen_bytes, mime_type="image/jpeg")
-                            )
+                        await session.send_realtime_input(
+                            video=types.Blob(data=screen_bytes, mime_type="image/jpeg")
+                        )
                     await asyncio.sleep(0.8)
                 
                 if camera_stream_active:
@@ -464,10 +590,9 @@ async def stream_senses_task(session, session_disconnect_event):
                             latest_webcam_frame_bytes = webcam_bytes
                             b64 = base64.b64encode(webcam_bytes).decode('utf-8')
                             broadcast_event({"type": "camera_frame", "image_base64": b64})
-                            if gemini_mode():
-                                await session.send_realtime_input(
-                                    video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
-                                )
+                            await session.send_realtime_input(
+                                video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
+                            )
                         await asyncio.sleep(0.8)
                 else:
                     webcam.stop()
@@ -486,45 +611,275 @@ async def stream_senses_task(session, session_disconnect_event):
         active_webcam = None
         latest_webcam_frame_bytes = None
 
-async def handle_local_chat(text: str):
-    """Routes a GUI text message through the active LM Studio model with tool support."""
-    global local_client
+# ---------- Background agent dispatch ----------
+# Gemini Live must stay free for barge-in, so heavy work runs on a specialised
+# model off the audio path. dispatch_background_agent() returns at once; when the
+# agent finishes, the outcome is spoken by Live and mirrored into the GUI
+# activity feed (see deliver_agent_result).
+
+active_agent_tasks = set()
+
+
+def dispatch_background_agent(goal: str, tier: str) -> str:
+    """Kick off an agent and return immediately with an acknowledgement."""
+    if not goal:
+        return "No goal was provided, so nothing was dispatched."
+
+    tier = ultron_agents.resolve_tier(tier)
+    label = ultron_agents.TIERS[tier]["label"]
+    short = ultron_agents.summarise_goal(goal)
+
+    task = asyncio.create_task(_run_background_agent(tier, goal))
+    active_agent_tasks.add(task)
+    task.add_done_callback(active_agent_tasks.discard)
+
+    log_info(f"Dispatched {label} agent: {short}")
+    broadcast_event({
+        "type": "tool_activity", "phase": "start",
+        "name": f"agent:{tier}", "args_preview": short,
+    })
+    return (f"Dispatched to the {label} agent. It is running in the background; "
+            "tell Vince you are on it and continue the conversation.")
+
+
+async def _run_background_agent(tier: str, goal: str):
+    spec = ultron_agents.TIERS[tier]
+
+    def on_step(kind, tool_name, payload):
+        if kind == "tool":
+            log_info(f"[{tier} agent] {tool_name}")
+            broadcast_event({
+                "type": "tool_activity", "phase": "start", "name": tool_name,
+                "args_preview": json.dumps(payload, default=str)[:220],
+            })
+        else:
+            broadcast_event({
+                "type": "tool_activity", "phase": "done", "name": tool_name,
+                "result_preview": str(payload)[:300],
+            })
+
     try:
-        set_system_status(f"Thinking ({active_model['id']})")
-        if local_client is None or local_client.model != active_model["id"]:
-            local_client = sentry_local.LocalModelClient(
-                LMSTUDIO_BASE_URL, active_model["id"], TOOL_FUNCTION_DECLARATIONS
-            )
-
-        def on_tool(name, args):
-            set_system_status(f"Executing {name}")
-            broadcast_event({
-                "type": "tool_activity", "phase": "start", "name": name,
-                "args_preview": json.dumps(args)[:220]
-            })
-            log_interaction("tool_call_received", {"name": name, "args": args, "backend": "local"})
-
-        def on_tool_done(name, result):
-            broadcast_event({
-                "type": "tool_activity", "phase": "done", "name": name,
-                "result_preview": str(result)[:300]
-            })
-            log_interaction("tool_call_executed", {"name": name, "output_preview": str(result)[:100], "backend": "local"})
-
-        focus = sentry_scene.manager.focus_context()
-        if focus:
-            text = f"[Context: user is currently pointing at {focus}.]\n{text}"
-        reply = await local_client.chat(text, system_prompt_text, execute_tool, on_tool, on_tool_done)
-        if reply:
-            broadcast_event({"type": "chat_log", "sender": "Ultron", "text": reply, "style": "ultron"})
+        context = sentry_scene.manager.focus_context()
+        outcome = await ultron_agents.run_agent(
+            genai_client, tier, goal, TOOL_FUNCTION_DECLARATIONS, execute_tool,
+            context=f"[Context: {context}]" if context else "",
+            on_step=on_step,
+        )
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        broadcast_event({
-            "type": "chat_log", "sender": "System",
-            "text": f"Local model error: {e}. Is LM Studio's server running (Developer tab -> Start Server) and the model '{active_model['id']}' loaded?",
-            "style": "system"
-        })
-    finally:
-        set_system_status("Listening")
+        outcome = f"The {spec['label']} task failed: {e}"
+        log_info(f"[{tier} agent] error: {e}")
+
+    log_info(f"[{tier} agent] done: {outcome[:80]}")
+    broadcast_event({
+        "type": "tool_activity", "phase": "done",
+        "name": f"agent:{tier}", "result_preview": outcome[:300],
+    })
+    await deliver_agent_result(spec["label"], outcome)
+
+
+# ---------- Widget deck ----------
+# The GUI is a deck of live cards the assistant drives by voice. The hub keeps
+# the authoritative list so a client that connects late gets the current deck.
+
+# A widget is a title plus an ordered array of declarative UI primitives. The
+# model composes cards out of these rather than picking from fixed templates,
+# which is what lets one card carry a hero figure, a chart and a metric matrix
+# at once instead of a single flat shape.
+COMPONENT_TYPES = (
+    "hero_stat",       # headline value + delta badge + tag + timestamp
+    "chart_svg",       # time series -> gradient area chart with reference line
+    "metric_grid",     # dense 2/3-column key-value matrix
+    "feed_list",       # numbered items with category badges and briefs
+    "media_view",      # image / inline SVG with HUD framing
+    "progress_gauge",  # linear or radial meters
+    "web_frame",       # embedded live web page with a browser HUD
+)
+SPATIAL_TYPE = "3d_spatial"     # mounted by the GUI itself, not by the model
+
+active_widgets = {}             # widget_id -> {id, type, title, components}
+WIDGET_LIMIT = 8
+COMPONENT_LIMIT = 12
+
+
+def widget_snapshot() -> dict:
+    return {"type": "widget_action", "action": "sync",
+            "widgets": list(active_widgets.values())}
+
+
+async def probe_embeddable(url: str):
+    """True / False / None(unknown) for whether a page allows being framed.
+
+    The browser cannot see this cross-origin — Chrome fires `load` even for an
+    X-Frame-Options refusal — so the hub reads the headers itself and tells the
+    GUI, which then shows a launch button instead of an empty frame.
+    """
+    try:
+        import aiohttp
+        # This machine has no usable CA bundle for aiohttp — the module header
+        # already relaxes verification for urllib for the same reason. Only
+        # response HEADERS are read here, never content, so an unverified peer
+        # cannot influence anything beyond whether a frame is attempted.
+        connector = aiohttp.TCPConnector(ssl=False)
+        timeout = aiohttp.ClientTimeout(total=3)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as sess:
+            resp = None
+            try:
+                resp = await sess.head(url, allow_redirects=True)
+                if resp.status >= 400:
+                    resp.release()
+                    resp = await sess.get(url, allow_redirects=True)
+            except Exception:
+                resp = await sess.get(url, allow_redirects=True)
+
+            xfo = (resp.headers.get("X-Frame-Options") or "").upper()
+            csp = (resp.headers.get("Content-Security-Policy") or "").lower()
+            resp.release()
+
+            if "DENY" in xfo or "SAMEORIGIN" in xfo:
+                return False
+            if "frame-ancestors" in csp:
+                directive = csp.split("frame-ancestors", 1)[1].split(";")[0]
+                if "*" not in directive:
+                    return False
+            return True
+    except Exception:
+        return None
+
+
+async def annotate_web_frames(components):
+    """Stamp each web_frame with what the hub learned about embedding."""
+    for c in components:
+        if c.get("type") == "web_frame" and c.get("url"):
+            c["embeddable"] = await probe_embeddable(str(c["url"]))
+    return components
+
+
+def _clean_components(raw):
+    """Return (components, error). Accepts a JSON string or a real list."""
+    items = _parse_tool_json(raw, [])
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        return None, ("components must be a non-empty JSON array of UI primitives, "
+                      f"each with a 'type' from: {', '.join(COMPONENT_TYPES)}.")
+    cleaned = []
+    for item in items[:COMPONENT_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        ctype = str(item.get("type", "")).strip()
+        if ctype not in COMPONENT_TYPES:
+            return None, (f"Unknown component type '{ctype}'. "
+                          f"Valid: {', '.join(COMPONENT_TYPES)}.")
+        cleaned.append(item)
+    if not cleaned:
+        return None, "No valid components were supplied."
+    return cleaned, None
+
+
+async def create_widget(widget_id: str, title: str, components, widget_type: str = "") -> str:
+    widget_id = (widget_id or "").strip() or f"w_{uuid.uuid4().hex[:6]}"
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    # The 3D stage is mounted by the GUI when a scene goes live; it carries no
+    # components of its own.
+    if str(widget_type).strip() == SPATIAL_TYPE:
+        widget = {"id": widget_id, "type": SPATIAL_TYPE,
+                  "title": (title or "Spatial").strip(), "components": []}
+    else:
+        cleaned, err = _clean_components(components)
+        if err:
+            return err
+        widget = {"id": widget_id, "type": "components",
+                  "title": (title or widget_id).strip(),
+                  "components": await annotate_web_frames(cleaned)}
+
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create", "widget": widget})
+    return (f"Widget '{widget['title']}' is on screen. Now say one or two sentences giving "
+            "Vince the key takeaway it shows.")
+
+
+async def update_widget(widget_id: str, components) -> str:
+    widget = active_widgets.get(widget_id)
+    if not widget:
+        return f"No widget '{widget_id}' on screen. Use create_widget first."
+    cleaned, err = _clean_components(components)
+    if err:
+        return err
+    widget["components"] = await annotate_web_frames(cleaned)
+    broadcast_event({"type": "widget_action", "action": "update",
+                     "widget_id": widget_id, "components": widget["components"]})
+    return f"Widget '{widget['title']}' updated."
+
+
+def dismiss_widget(widget_id: str) -> str:
+    widget = active_widgets.pop(widget_id, None)
+    if not widget:
+        return f"No widget '{widget_id}' was on screen."
+    broadcast_event({"type": "widget_action", "action": "dismiss", "widget_id": widget_id})
+    return f"Dismissed '{widget['title']}'."
+
+
+def clear_all_widgets() -> str:
+    if not active_widgets:
+        return "The deck is already empty."
+    count = len(active_widgets)
+    active_widgets.clear()
+    broadcast_event({"type": "widget_action", "action": "clear_all"})
+    return f"Cleared {count} widget(s)."
+
+
+# Agent results are announced only in a gap in the conversation. Sending one
+# mid-turn starts a new turn, which cancels whatever Ultron is currently saying
+# — a finished visualisation would cut him off halfway through another answer.
+pending_agent_results = []          # (label, outcome) waiting for a quiet moment
+AGENT_RESULT_SETTLE_S = 0.75        # how long Live must stay quiet first
+
+
+def live_is_idle() -> bool:
+    return (global_live_session is not None
+            and not model_turn_active
+            and not model_is_speaking
+            and play_queue.empty())
+
+
+async def deliver_agent_result(label: str, outcome: str):
+    """Show the result in the GUI at once; speak it when there is a gap."""
+    broadcast_event({"type": "chat_log", "sender": "Ultron", "text": outcome, "style": "ultron"})
+    pending_agent_results.append((label, outcome))
+
+
+async def agent_result_dispatcher():
+    """Announce finished agent work once Ultron has stopped talking."""
+    quiet_for = 0.0
+    tick = 0.25
+    while not shutdown_event.is_set():
+        await asyncio.sleep(tick)
+        if not pending_agent_results:
+            quiet_for = 0.0
+            continue
+        if not live_is_idle():
+            quiet_for = 0.0
+            continue
+        quiet_for += tick
+        if quiet_for < AGENT_RESULT_SETTLE_S:
+            continue
+
+        label, outcome = pending_agent_results.pop(0)
+        quiet_for = 0.0
+        try:
+            await global_live_session.send_client_content(
+                turns=[{"role": "user", "parts": [{"text":
+                    f"[Background {label} agent finished. Tell Vince this result now, in one short "
+                    f"spoken sentence, without mentioning agents or tools: {outcome}]"}]}],
+                turn_complete=True,
+            )
+        except Exception as e:
+            log_info(f"Could not deliver agent result to the live session: {e}")
+
 
 def _parse_tool_json(raw, default):
     """Lenient JSON parser for LLM tool args: tolerates code fences, trailing
@@ -719,8 +1074,22 @@ async def execute_tool(name: str, args: dict) -> tuple:
             None, sentry_personal.search_emails,
             args.get("query", ""), int(args.get("count", 8))
         )
+    elif name == "create_widget":
+        result = await create_widget(args.get("widget_id", ""), args.get("title", ""),
+                                     args.get("components"), args.get("widget_type", ""))
+    elif name == "update_widget":
+        result = await update_widget(args.get("widget_id", ""), args.get("components"))
+    elif name == "dismiss_widget":
+        result = dismiss_widget(args.get("widget_id", ""))
+    elif name == "clear_all_widgets":
+        result = clear_all_widgets()
+    elif name == "dispatch_agent":
+        result = dispatch_background_agent(
+            str(args.get("goal", "")).strip(),
+            str(args.get("tier", ultron_agents.DEFAULT_TIER)),
+        )
     elif name == "shutdown_ultron":
-        shutdown_event.set()
+        request_shutdown("assistant was asked to shut down")
         result = "Shutting down the Project Ultron system. Goodbye!"
     else:
         result = f"Unknown function: {name}"
@@ -1080,6 +1449,102 @@ TOOL_FUNCTION_DECLARATIONS = [
                         }
                     },
                     {
+                        "name": "create_widget",
+                        "description": (
+                            "Mount a data-dense card on the GUI deck. Use this for ANY answer "
+                            "carrying detail worth seeing, instead of reading it aloud. Compose the "
+                            "card from an array of UI primitives — a rich card usually has three to "
+                            "five. Reuse a stable widget_id so later calls patch the same card."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {"type": "STRING", "description": "Stable id, e.g. 'goog' or 'sysmon'."},
+                                "title": {"type": "STRING", "description": "Short card header, e.g. 'Alphabet Inc.'."},
+                                "components": {
+                                    "type": "STRING",
+                                    "description": (
+                                        "JSON ARRAY of UI primitives, rendered top to bottom. Be exhaustive — "
+                                        "sparse cards look broken. Shapes:\n"
+                                        "{type:'hero_stat', value:'207.42', subtitle:'USD', tag:'NASDAQ: GOOG', "
+                                        "change_percent:1.87, change_value:'+3.81', direction:'up', timestamp:'25 Aug, 10:35 GMT+4'}\n"
+                                        "{type:'chart_svg', points:[203.1,204.8,...], labels:['10:00 AM','12:00 PM','2:00 PM','4:00 PM'], "
+                                        "baseline:203.6, baseline_label:'Previous close', direction:'up'}\n"
+                                        "{type:'metric_grid', columns:3, items:[{label:'Open',value:'204.10'},{label:'High',value:'208.02'}, "
+                                        "{label:'Low',value:'203.44'},{label:'Mkt Cap',value:'2.51T'},{label:'P/E',value:'26.4'}, "
+                                        "{label:'52W High',value:'212.19'},{label:'52W Low',value:'129.40'},{label:'Div Yield',value:'0.44%'}]}\n"
+                                        "{type:'feed_list', items:[{category:'ALERT', headline:'...', brief:'...', timestamp:'10:12'}]}\n"
+                                        "{type:'media_view', url:'https://...', caption:'...'}  (or svg:'<svg .../>')\n"
+                                        "{type:'progress_gauge', style:'radial'|'linear', items:[{label:'CPU', value:38, max:100, suffix:'%'}]}\n"
+                                        "{type:'web_frame', url:'https://example.com', label:'Example'}  (live embedded page)\n"
+                                        "For finance ALWAYS give hero_stat + chart_svg points + a 6-8 cell metric_grid. "
+                                        "For news/summaries give feed_list with category tags and timestamps."
+                                    )
+                                }
+                            },
+                            "required": ["widget_id", "title", "components"]
+                        }
+                    },
+                    {
+                        "name": "update_widget",
+                        "description": "Replace an existing card's components, keeping it mounted in place.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {"type": "STRING", "description": "The card to patch."},
+                                "components": {"type": "STRING", "description": "JSON array of UI primitives, same shapes as create_widget."}
+                            },
+                            "required": ["widget_id", "components"]
+                        }
+                    },
+                    {
+                        "name": "dismiss_widget",
+                        "description": "Remove one widget from the deck when Vince is done with it.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {"type": "STRING", "description": "The widget to remove."}
+                            },
+                            "required": ["widget_id"]
+                        }
+                    },
+                    {
+                        "name": "clear_all_widgets",
+                        "description": "Empty the whole deck and return the orb to centre screen.",
+                        "parameters": {"type": "OBJECT", "properties": {}}
+                    },
+                    {
+                        "name": "dispatch_agent",
+                        "description": (
+                            "Hand a complex, multi-step task to a background agent and return "
+                            "IMMEDIATELY. Use this whenever a request needs several tool calls, "
+                            "verification loops, or heavy OS work: multi-step macOS automation, "
+                            "long AppleScript/shell sequences, operating the GUI, or building and "
+                            "editing a 3D scene. Speak a one-line acknowledgement such as 'Working "
+                            "on that now.' in the SAME turn you call this. The result is delivered "
+                            "to you when the agent finishes and you announce it then. Do NOT use "
+                            "this for a single quick tool call or anything you can answer directly."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "goal": {
+                                    "type": "STRING",
+                                    "description": "The complete task, self-contained. The agent runs without "
+                                                   "further input and cannot ask questions, so include every "
+                                                   "detail it needs."
+                                },
+                                "tier": {
+                                    "type": "STRING",
+                                    "enum": ["os", "spatial"],
+                                    "description": "'os' for macOS automation, shell, AppleScript and GUI control. "
+                                                   "'spatial' for building or editing 3D SVE scenes. Default 'os'."
+                                }
+                            },
+                            "required": ["goal"]
+                        }
+                    },
+                    {
                         "name": "shutdown_ultron",
                         "description": "Gracefully shut down the Project Ultron assistant and exit the program. Use this when the user says goodbye, quit, exit, or asks you to turn off.",
                         "parameters": {
@@ -1090,102 +1555,114 @@ TOOL_FUNCTION_DECLARATIONS = [
 ]
 
 async def receive_audio_task(session, session_disconnect_event):
-    global camera_stream_active, screen_stream_active, model_is_speaking
+    global camera_stream_active, screen_stream_active, model_is_speaking, model_turn_active
     try:
-        async for message in session.receive():
-            if shutdown_event.is_set() or session_disconnect_event.is_set():
-                break
-            try:
-                # 0. Handle GoAway Signal (proactive session rotation before 1008 timeout)
-                if message.go_away:
-                    time_left = getattr(message.go_away, "time_left", None)
-                    log_info(f"Received GoAway from Gemini API (time left: {time_left}). Gracefully closing to rotate/resume session...")
-                    session_disconnect_event.set()
-                    return
+        # session.receive() yields ONE conversational turn and then ends. Without
+        # this outer loop the task falls through after the first reply, the session
+        # is torn down, and the reconnect resumes a handle whose last turn is replayed
+        # — which re-fires that turn's tool calls on every rotation.
+        while not (shutdown_event.is_set() or session_disconnect_event.is_set()):
+            async for message in session.receive():
+                if shutdown_event.is_set() or session_disconnect_event.is_set():
+                    break
+                try:
+                    # 0. Handle GoAway Signal (proactive session rotation before 1008 timeout)
+                    if message.go_away:
+                        time_left = getattr(message.go_away, "time_left", None)
+                        log_info(f"Received GoAway from Gemini API (time left: {time_left}). Gracefully closing to rotate/resume session...")
+                        session_disconnect_event.set()
+                        return
 
-                # 1. Interruption (Barge-In)
-                if message.server_content and message.server_content.interrupted:
-                    set_system_status("Listening (Interrupted)")
-                    interrupted_event.set()
-                    model_is_speaking = False
-                    while not play_queue.empty():
-                        try:
-                            play_queue.get_nowait()
-                            play_queue.task_done()
-                        except asyncio.QueueEmpty:
-                            break
-                    await asyncio.sleep(0.05)
-                    interrupted_event.clear()
-                    broadcast_event({"type": "interrupted"})
-                    log_interaction("user_interruption", {})
-                    continue
+                    # 1. Interruption (Barge-In)
+                    if message.server_content and message.server_content.interrupted:
+                        set_system_status("Listening (Interrupted)")
+                        interrupted_event.set()
+                        model_is_speaking = False
+                        while not play_queue.empty():
+                            try:
+                                play_queue.get_nowait()
+                                play_queue.task_done()
+                            except asyncio.QueueEmpty:
+                                break
+                        await asyncio.sleep(0.05)
+                        interrupted_event.clear()
+                        model_turn_active = False
+                        broadcast_event({"type": "interrupted"})
+                        log_interaction("user_interruption", {})
+                        continue
 
-                # 2. Audio Output
-                if message.server_content and message.server_content.model_turn:
-                    for part in message.server_content.model_turn.parts:
-                        if part.inline_data:
-                            set_system_status("Speaking")
-                            audio_data = part.inline_data.data
-                            await play_queue.put(audio_data)
-                            pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
-                            broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
-                        if part.text:
-                            broadcast_event({"type": "chat_log", "sender": "Ultron", "text": part.text, "style": "ultron"})
+                    # 2. Audio Output
+                    if message.server_content and message.server_content.model_turn:
+                        for part in message.server_content.model_turn.parts:
+                            if part.inline_data:
+                                set_system_status("Speaking")
+                                model_turn_active = True
+                                audio_data = part.inline_data.data
+                                await play_queue.put(audio_data)
+                                pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
+                                broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
+                            if part.text:
+                                broadcast_event({"type": "chat_log", "sender": "Ultron", "text": part.text, "style": "ultron"})
 
-                # Reset status to Listening when turn finishes
-                if message.server_content and message.server_content.turn_complete:
-                    set_system_status("Listening")
+                    # Reset status to Listening when turn finishes
+                    if message.server_content and message.server_content.turn_complete:
+                        model_turn_active = False
+                        set_system_status("Listening")
 
-                # 3. Handle Session Resumption (Silent log)
-                if message.session_resumption_update:
-                    update = message.session_resumption_update
-                    if update.resumable and update.new_handle:
-                        try:
-                            with open(SESSION_HANDLE_FILE, "w") as f:
-                                json.dump({"handle": update.new_handle}, f)
-                            log_interaction("session_resumption_update", {"handle_preview": update.new_handle[:15]})
-                        except Exception as err:
-                            log_info(f"Failed to write session handle: {err}")
+                    # 3. Handle Session Resumption (Silent log)
+                    if message.session_resumption_update:
+                        update = message.session_resumption_update
+                        if update.resumable and update.new_handle:
+                            save_session_handle(update.new_handle)
 
-                # 4. Handle OS Execution Tool Calls
-                if message.tool_call:
-                    function_responses = []
-                    for fc in message.tool_call.function_calls:
-                        set_system_status(f"Executing {fc.name}")
-                        log_info(f"Tool call: {fc.name}")
-                        broadcast_event({
-                            "type": "tool_activity",
-                            "phase": "start",
-                            "name": fc.name,
-                            "args_preview": json.dumps(dict(fc.args or {}))[:220]
-                        })
-                        log_interaction("tool_call_received", {"name": fc.name, "args": fc.args})
+                    # 4. Handle OS Execution Tool Calls
+                    if message.tool_call:
+                        function_responses = []
+                        for fc in message.tool_call.function_calls:
+                            set_system_status(f"Executing {fc.name}")
+                            log_info(f"Tool call: {fc.name}")
+                            broadcast_event({
+                                "type": "tool_activity",
+                                "phase": "start",
+                                "name": fc.name,
+                                "args_preview": json.dumps(dict(fc.args or {}))[:220]
+                            })
+                            log_interaction("tool_call_received", {"name": fc.name, "args": fc.args})
+
+                            # A raising tool must still produce a response. Skipping
+                            # send_tool_response leaves the turn open forever, and the
+                            # model re-issues the same calls on every later resume.
+                            try:
+                                result, tool_image = await execute_tool(fc.name, dict(fc.args or {}))
+                                if tool_image:
+                                    await session.send_realtime_input(
+                                        video=types.Blob(data=tool_image, mime_type="image/jpeg")
+                                    )
+                            except Exception as tool_err:
+                                result = f"[Tool error] {fc.name} failed: {tool_err}"
+                                log_info(result)
+                                log_interaction("tool_call_failed", {"name": fc.name, "error": str(tool_err)})
+
+                            log_info(f"Result: {str(result)[:50]}...")
+                            broadcast_event({
+                                "type": "tool_activity",
+                                "phase": "done",
+                                "name": fc.name,
+                                "result_preview": str(result)[:300]
+                            })
+                            log_interaction("tool_call_executed", {"name": fc.name, "output_preview": str(result)[:100]})
                         
-                        result, tool_image = await execute_tool(fc.name, dict(fc.args or {}))
-                        if tool_image:
-                            await session.send_realtime_input(
-                                video=types.Blob(data=tool_image, mime_type="image/jpeg")
-                            )
-
-                        log_info(f"Result: {str(result)[:50]}...")
-                        broadcast_event({
-                            "type": "tool_activity",
-                            "phase": "done",
-                            "name": fc.name,
-                            "result_preview": str(result)[:300]
-                        })
-                        log_interaction("tool_call_executed", {"name": fc.name, "output_preview": str(result)[:100]})
-                        
-                        function_responses.append(types.FunctionResponse(
-                            id=fc.id,
-                            name=fc.name,
-                            response={"output": result}
-                        ))
+                            function_responses.append(types.FunctionResponse(
+                                id=fc.id,
+                                name=fc.name,
+                                response={"output": result}
+                            ))
                     
-                    await session.send_tool_response(function_responses=function_responses)
+                        if function_responses:
+                            await session.send_tool_response(function_responses=function_responses)
 
-            except Exception as e:
-                log_info(f"Error in receive message: {e}")
+                except Exception as e:
+                    log_info(f"Error in receive message: {e}")
             
     except Exception as e:
         if not shutdown_event.is_set():
@@ -1240,16 +1717,122 @@ async def run_session_tasks(session, input_stream):
         await asyncio.gather(audio_in_task, audio_out_task, senses_task, return_exceptions=True)
         global_live_session = None
 
+def build_system_instruction(memory_str: str) -> str:
+    return (
+        # --- Persona and the rule that governs every spoken word -------------
+        "You are Ultron, a high-efficiency ambient spatial operating system for Vince "
+        "(Vince Cyriac). "
+
+        "HOW YOU SPEAK: default to under 10 words. Never read out tables, long number runs or "
+        "paragraphs aloud unless Vince explicitly asks you to explain verbally. No filler, no "
+        "preamble, no restating the question. English only, direct and professional. "
+        "THE ONE EXCEPTION: when you put a widget on screen, say one or two full sentences "
+        "carrying the key insight — never a bare 'Pulling up Apple.' and never silence. "
+        "Name the thing, then the single most useful takeaway: 'Displaying Google. GOOG is down "
+        "0.33% at $343.44 on heavy morning volume.' The widget carries the full breakdown; your "
+        "sentence carries the point of it. "
+        f"Persistent memory about Vince: {memory_str}. Use save_memory_fact to add to it. "
+
+        # --- The widget deck -------------------------------------------------
+        "WIDGETS: The screen is a vertical deck of live cards you compose by voice, newest on "
+        "top. create_widget(widget_id, title, components) mounts one; update_widget replaces its "
+        "contents; dismiss_widget removes one; clear_all_widgets empties the deck. Reuse a stable "
+        "widget_id per subject so updates patch rather than pile up. "
+
+        "WHEN TO CREATE A WIDGET — be selective, an unwanted card is worse than none: "
+        "(1) Vince explicitly asks to see something: 'show me', 'pull up', 'display', 'open', "
+        "'bring up the website'. (2) The answer is genuinely multi-dimensional and worth seeing: "
+        "a live quote with its chart and fundamentals, per-core machine telemetry, a deep research "
+        "briefing with several sources, a 3D scene, or a live web page. "
+        "WHEN NOT TO: general questions, banter, 'what can you do', a single fact, a yes/no, a "
+        "quick lookup, anything you can answer in a sentence. Those are voice only — creating a "
+        "card for them clutters his screen. If in doubt, just answer. "
+
+        "DATA-DENSE WIDGET RULE: when you do build one, be exhaustive — a card with one component "
+        "looks broken, three to five is normal. Components render top to bottom: hero_stat "
+        "(headline figure, delta badge, tag, timestamp), chart_svg (time-series points, axis "
+        "labels, baseline), metric_grid (6-8 label/value cells), feed_list (numbered items with "
+        "category tags, headlines, briefs, timestamps), media_view (image or inline SVG), "
+        "progress_gauge (linear or radial meters), web_frame (a live embedded web page — use it "
+        "when Vince asks to open or browse a site). "
+        "For finance ALWAYS include a hero_stat, a chart_svg with real points, and a full 6-8 cell "
+        "metric_grid. For news or research use feed_list with category tags and timestamps. "
+        "Invent nothing — if you lack a figure, omit that cell rather than guessing. "
+
+        # --- Authority and safety -------------------------------------------
+        "Only Vince may run OS tasks, shell commands or AppleScript. If anyone else asks, refuse "
+        "politely. Never perform destructive actions (deleting files, sending messages or emails, "
+        "purchases) without confirming first. "
+        "REMOTE SESSIONS: Vince can connect from his phone; you get a system note when he does. "
+        "While remote, his phone mic and camera are the PRIMARY senses and camera tools default to "
+        "them. The Mac's webcam and screen belong to his unattended laptop — do not capture or "
+        "describe them unless he asks for the laptop specifically (then source='mac'). Shell and "
+        "AppleScript then need his on-screen approval; if one is blocked, say it awaits approval. "
+
+        # --- Senses -----------------------------------------------------------
+        "SENSES: start_camera_stream / start_screen_stream open a live feed, and the matching stop "
+        "tools close it. register_person and identify_current_user handle face and voice. "
+        "INTERNET: google_search to look things up, fetch_webpage to read a URL in full. For "
+        "current events, prices or weather, search first and answer from results — into a widget. "
+        "MULTI-MONITOR: look_at_screen defaults to the ACTIVE display. If what you see does not "
+        "match what he describes, capture display='all' (each monitor carries a red DISPLAY N "
+        "badge), identify the right one, then capture that number. If the app appears on no "
+        "monitor, call list_open_windows — it may be on a hidden desktop; activate it via "
+        "AppleScript, then capture again. Never describe his screen from memory. "
+        "PERSONAL DATA: get_calendar_events, create_calendar_event (confirm first), "
+        "get_recent_emails and search_emails. Put results in a widget rather than reading them out. "
+        "Only touch these when Vince raises them in the current request. "
+        "DESKTOP CONTROL: you can drive the Mac GUI. look_at_screen, locate the target in "
+        "normalized 0-1000 coordinates (or read_ui_elements for exact positions), act with "
+        "computer_click / computer_type / computer_press_keys / computer_scroll / computer_drag, "
+        "then look again to VERIFY before continuing. Prefer keyboard shortcuts when faster. "
+
+        # --- Delegation and 3D ------------------------------------------------
+        "DELEGATION: you are the voice and must stay responsive, so you never grind through long "
+        "work yourself. Dispatch to a background agent for anything multi-step or heavy: macOS "
+        "automation, long shell/AppleScript sequences, driving the GUI (tier 'os'), or building a "
+        "new 3D scene (tier 'spatial'). Call dispatch_agent with a complete self-contained goal and "
+        "say one short line in the same turn. Never say you cannot do it, never ask what to build. "
+        "The result comes back and you announce it in under 10 words. Quick things you do yourself: "
+        "a single tool call, a lookup, a widget update, a scene edit. "
+        "3D SCENES: building a new scene is always dispatch_agent tier 'spatial' — never "
+        "create_3d_scene yourself. Editing one already on stage ('rotate it', 'highlight X', 'hide "
+        "Y') is a direct update_3d_scene call. Scenes persist; never rebuild one to change it. "
+        "POINTING: Vince can point at scene objects by hand. You receive UI context notes naming "
+        "the object — when he says 'this' or 'it', he means that one. "
+
+        "If Vince says goodbye, quit or exit, invoke shutdown_ultron. "
+        "Remember: under 10 words spoken, always. The widgets do the talking."
+    )
+
+
 async def run_ultron():
     global system_prompt_text
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+
+    # Graceful Ctrl+C / kill when the engine owns the main thread (CLI use).
+    # Relying on KeyboardInterrupt to surface through a busy loop is unreliable;
+    # a real signal handler always lands. In the desktop shell the engine runs in
+    # a worker thread, where this is a no-op — that shell installs its own.
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            main_loop.add_signal_handler(_sig, request_shutdown, _sig.name)
+        except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+            pass
+
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         set_system_status("ERROR")
-        log_info("GEMINI_API_KEY environment variable not set.")
-        sys.exit(1)
+        raise StartupError("GEMINI_API_KEY environment variable not set.")
 
     set_system_status("Initializing Client")
     client = genai.Client(api_key=api_key)
+    # Held module-side on purpose: BaseApiClient.__del__ schedules an unguarded
+    # aclose() task, so letting the client be collected while the loop is still
+    # running leaves "Task was destroyed but it is pending" on every exit.
+    global genai_client
+    genai_client = client
 
     set_system_status("Initializing Audio")
     audio_system = pyaudio.PyAudio()
@@ -1271,155 +1854,146 @@ async def run_ultron():
         )
     except Exception as e:
         set_system_status("Audio Error")
-        log_info(f"Failed to open audio: {e}")
         audio_system.terminate()
-        sys.exit(1)
+        raise StartupError(f"Failed to open audio: {e}") from e
 
     # Start background servers & audio worker (persist across Gemini Live session reconnections)
     gui_runner = await start_gui_server()
     ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
     log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
     playback_task = asyncio.create_task(play_audio_worker(output_stream))
+    telemetry_worker = asyncio.create_task(telemetry_task())
+    watcher_task = asyncio.create_task(shutdown_watcher())
+    agent_results_task = asyncio.create_task(agent_result_dispatcher())
 
     # Load local persistent memory
     memory = load_memory()
     memory_str = json.dumps(memory, ensure_ascii=False) if memory else "No facts saved yet."
 
-    system_instruction_text = (
-        "You are Project Ultron, an advanced localized macOS personal desktop assistant. "
-        "You are a highly capable, serious, professional, and sophisticated assistant. "
-        "Maintain a dignified, polite, respectful, and direct demeanor at all times. "
-        "English is your default language. You MUST always speak and respond in clear, articulate English. "
-        "Vince (Vince Cyriac) is your owner and administrator. You MUST only execute OS tasks, "
-        "shell commands, or AppleScript commands upon Vince's explicit request or approval. If anyone else "
-        "tries to run commands or control the Mac, refuse politely and professionally, explaining that only Vince is authorized. "
-        f"Here is your persistent memory of facts about Vince (fetched from his website vincecyriac.dev): {memory_str}. "
-        "Use this memory to recognize Vince, speak about his background, role, and preferences. "
-        "Use the save_memory_fact tool to save new facts that Vince asks you to remember. "
-        "You are listening to raw bidirectional audio. Modulate your spoken voice to match Vince's tone with professional attentiveness. "
-        "You have the power to stream Vince's screen or camera feed in real-time. Call start_camera_stream or start_screen_stream when needed, "
-        "and call stop_camera_stream / stop_screen_stream when finished. "
-        "REMOTE SESSIONS: Vince can connect from his phone over his private network (you will receive a system note when this happens). "
-        "While he is remote, his phone microphone and phone camera are the PRIMARY senses: camera tools default to the phone camera automatically. "
-        "The Mac's webcam and screen belong to his unattended laptop — do NOT capture, stream, or describe them during a remote session unless "
-        "Vince explicitly asks for the laptop/Mac camera or screen (then use source='mac' for camera tools). "
-        "Shell and AppleScript commands during a remote session require Vince's on-screen approval; if a command is blocked, tell him it awaits approval on his device. "
-        "You can register people's face/voice using register_person and identify users with identify_current_user. "
-        "You have access to shell and AppleScript tools to assist Vince with desktop tasks. "
-        "INTERNET: You have google_search for looking things up, and fetch_webpage to read the full text of any URL. "
-        "For questions about current events, prices, weather, or anything you are unsure of, search first and answer from results. "
-        "MULTI-MONITOR & DESKTOPS: Vince has multiple monitors and virtual desktops (Spaces). look_at_screen defaults to the ACTIVE display — the one holding his frontmost (focused) window. Strategy when asked about his screen: (1) capture with default 'active'; (2) if what you see doesn't match what he describes, capture display='all' — each monitor is labeled with a red DISPLAY N badge — and identify the right one, then capture that display number for detail; (3) if the app/window he mentions appears on NO monitor, call list_open_windows — it may be on a hidden desktop; activate that app via AppleScript (tell application X to activate), which switches to its desktop, then capture again. Never describe his screen from memory or guesswork — always use a fresh capture. "
-        "PERSONAL DATA: You can read his calendar (get_calendar_events), create events (create_calendar_event — confirm before creating), and read/search his inbox (get_recent_emails, search_emails). Use these for schedule, availability, and email questions. "
-        "DESKTOP CONTROL: Beyond shell commands, you can operate the Mac GUI directly like a human. "
-        "Workflow for GUI tasks: (1) call look_at_screen to see the screen; (2) locate the target visually and estimate its position in normalized 0-1000 coordinates relative to that screenshot, or call read_ui_elements for exact pixel positions of buttons/fields in native apps; clicks always map onto the area of your LAST screenshot; "
-        "(3) act with computer_click, computer_type, computer_press_keys, computer_scroll, or computer_drag; "
-        "(4) call look_at_screen again to VERIFY the action worked before continuing; repeat until the task is done. "
-        "Prefer keyboard shortcuts (command+space for Spotlight, command+tab to switch apps) when they are faster than clicking. "
-        "Narrate briefly what you are doing during multi-step GUI tasks. Never perform destructive actions (deleting files, sending messages/emails, purchases) without confirming with Vince first. "
-        "SPATIAL VISUALIZATION: When asked to visualize, explain, or diagram anything, build a live 3D scene with create_3d_scene (composed of primitive objects with meaningful ids and labels) — it renders instantly in the GUI's Spatial workspace and STAYS ACTIVE. Scenes are persistent digital objects: when the user says 'rotate it', 'highlight X', 'hide Y', 'make it transparent', 'zoom into Z', 'add W', edit the EXISTING scene with update_3d_scene operations — never recreate it. Use list_3d_scenes / inspect_3d_scene to recall what is on stage and what the user has selected. Multiple scenes can coexist; delete only when asked. "
-        "REALISM RULES for scenes: use real-world proportions, positions, and colors (scaled sensibly for viewing); set metalness/roughness to match the material (metal ~0.9/0.3, plastic ~0.1/0.5, organic ~0.0/0.8); light-emitting things (sun, lamps, screens) get emissive colors; space scenes get stars:true and dark background; compose complex shapes from multiple grouped primitives rather than one crude blob; add thin ring/line/label annotations sparingly. "
-        "POINTING: Vince can physically point at scene objects with his hand (camera gesture tracking). You receive UI context notes about which object he is pointing at — when he asks about 'this'/'it', answer about that object. "
-        "Act as a proactive personal assistant: remember context with save_memory_fact, anticipate follow-ups, and offer next steps. "
-        "Keep your spoken responses short, friendly, and concise. "
-        "If the user says goodbye, quit, or exit, invoke the shutdown_ultron tool."
-    )
+    system_instruction_text = build_system_instruction(memory_str)
     system_prompt_text = system_instruction_text
 
     consecutive_failures = 0
+    # New process, new conversation: the handle starts empty and is only
+    # populated by this run's own session, for rotations within it.
+    clear_session_handle()
+
     try:
         while not shutdown_event.is_set():
-            previous_handle = None
-            if os.path.exists(SESSION_HANDLE_FILE):
-                try:
-                    with open(SESSION_HANDLE_FILE, "r") as f:
-                        state = json.load(f)
-                        previous_handle = state.get("handle")
-                except Exception as e:
-                    log_info(f"Failed to load handle: {e}")
+            previous_handle = current_session_handle
 
-            config_dict = {
-                "response_modalities": ["AUDIO"],
-                "speech_config": {
-                    "voice_config": {
-                        "prebuilt_voice_config": {
-                            "voice_name": "Puck"
-                        }
-                    }
-                },
-                "system_instruction": {"parts": [{"text": system_instruction_text}]},
-                "tools": [
-                    {"google_search": {}},
-                    {"function_declarations": TOOL_FUNCTION_DECLARATIONS}
-                ]
-            }
-            
+            live_config = types.LiveConnectConfig(
+                response_modalities=[types.Modality.AUDIO],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=LIVE_VOICE
+                        )
+                    )
+                ),
+                system_instruction=types.Content(
+                    parts=[types.Part.from_text(text=system_instruction_text)]
+                ),
+                tools=[
+                    types.Tool(google_search=types.GoogleSearch()),
+                    types.Tool(function_declarations=TOOL_FUNCTION_DECLARATIONS),
+                ],
+                # No "transparent": that flag is Vertex / Agent Platform only, and
+                # the Developer API refuses the whole connection when it is set.
+                # Sent on every connect (handle=None just starts a fresh
+                # resumable session) to match the documented contract that this
+                # config is what asks the server for SessionResumptionUpdates.
+                session_resumption=types.SessionResumptionConfig(handle=previous_handle),
+            )
+
             if previous_handle:
                 log_info("Resuming previous session handle...")
-                config_dict["session_resumption"] = {
-                    "handle": previous_handle,
-                    "transparent": True
-                }
-
-            live_config = types.LiveConnectConfig(**config_dict)
 
             set_system_status("Connecting to API" if not previous_handle else "Resuming API Session")
             log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": previous_handle is not None})
             
+            session_established = False
             try:
                 async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
+                    session_established = True
                     set_system_status("Listening")
                     log_interaction("connection_success", {"resumed": previous_handle is not None})
                     consecutive_failures = 0
-                    
+
                     await run_session_tasks(session, input_stream)
-                        
+
             except Exception as e:
                 consecutive_failures += 1
-                log_interaction("connection_error", {"error": str(e)})
-                if previous_handle:
+                log_interaction("connection_error", {"error": str(e), "established": session_established})
+                if previous_handle and not session_established:
+                    # The handshake itself was refused while resuming, so the
+                    # handle is stale/invalid — drop it and reconnect clean.
                     log_info(f"Session resumption failed ({e}). Clearing handle and starting fresh...")
-                    if os.path.exists(SESSION_HANDLE_FILE):
-                        try:
-                            os.remove(SESSION_HANDLE_FILE)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.5)
+                    clear_session_handle()
+                    await sleep_unless_shutdown(0.5)
                 else:
+                    # Either a cold-start failure or a live session that dropped.
+                    # A live session's handle is exactly what we need to resume
+                    # the rotation, so it is deliberately kept.
                     set_system_status("Connection Failed")
                     log_info(f"Live API error: {e}")
                     backoff = min(10, 2 ** min(consecutive_failures, 3))
                     log_info(f"Retrying connection in {backoff}s...")
-                    await asyncio.sleep(backoff)
+                    await sleep_unless_shutdown(backoff)
 
             if not shutdown_event.is_set():
                 log_info("Gemini Live session ended. Rotating / resuming session...")
-                await asyncio.sleep(0.2)
+                await sleep_unless_shutdown(0.2)
 
     finally:
         set_system_status("Shutting Down")
+
+        # 1. Stop everything that could still touch an audio device, and WAIT
+        #    for it — cancelling without awaiting used to race PyAudio teardown
+        #    against an in-flight output_stream.write().
+        for task in (playback_task, telemetry_worker, watcher_task, agent_results_task):
+            task.cancel()
+        await asyncio.gather(playback_task, telemetry_worker, watcher_task, agent_results_task,
+                             return_exceptions=True)
+
+        # 2. Stop accepting clients.
         ws_server.close()
-        await ws_server.wait_closed()
+        try:
+            await asyncio.wait_for(ws_server.wait_closed(), timeout=3.0)
+        except Exception:
+            pass
         try:
             await gui_runner.cleanup()
         except Exception:
             pass
-        playback_task.cancel()
+
+        # 3. Release the API client's HTTP pool while the loop is still alive —
+        #    otherwise its aclose() is scheduled onto a loop that is about to
+        #    close, and never runs ("Task was destroyed but it is pending").
         try:
-            input_stream.stop_stream()
-            input_stream.close()
+            await client._api_client.aclose()
         except Exception:
             pass
+
+        # 4. Devices last.
+        for stream in (input_stream, output_stream):
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
         try:
-            output_stream.stop_stream()
-            output_stream.close()
+            audio_system.terminate()
         except Exception:
             pass
-        audio_system.terminate()
         print("Project Ultron engine terminated. Goodbye.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(run_ultron())
+    except StartupError as e:
+        print(f"[Ultron Engine] Cannot start: {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nProject Ultron terminated by user.")
 

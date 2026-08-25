@@ -9,3 +9,4 @@ pyobjc-framework-Quartz
 pywebview
 websockets
 aiohttp
+psutil
