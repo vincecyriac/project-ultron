@@ -92,6 +92,72 @@ body.spatial-active::before {
 .tele-stat { font-variant-numeric: tabular-nums; }
 .tele-stat.warm { color: var(--amber); opacity: 0.9; }
 
+/* ---------- Background agent status ---------- */
+
+.agent-rail {
+  position: fixed;
+  top: 44px;
+  left: var(--gutter);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: calc(var(--rail) - var(--gutter) * 2);
+  pointer-events: none;
+}
+
+.agent-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 11px;
+  background: var(--glass-solid);
+  border: 1px solid var(--cyan-line);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  animation: agent-in 0.35s var(--ease-spatial) both;
+  transition: opacity 0.4s ease, transform 0.4s ease, border-color 0.3s ease;
+}
+
+@keyframes agent-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.agent-spinner {
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid rgba(0, 242, 254, 0.25);
+  border-top-color: var(--cyan);
+  border-radius: 50%;
+  animation: agent-spin 0.8s linear infinite;
+}
+
+@keyframes agent-spin { to { transform: rotate(360deg); } }
+
+.agent-name { color: var(--cyan); opacity: 0.9; }
+.agent-goal { overflow: hidden; text-overflow: ellipsis; }
+
+.agent-chip.done {
+  border-color: rgba(0, 255, 136, 0.35);
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.agent-chip.done .agent-spinner {
+  animation: none;
+  border-color: var(--emerald);
+  border-top-color: var(--emerald);
+}
+
 /* ---------- Holographic Orb ---------- */
 
 .orb-stage {

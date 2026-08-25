@@ -12,8 +12,8 @@
  *
  * The core is an additively-blended plasma sphere wrapped in two fresnel glow
  * shells (a shader-side stand-in for a bloom pass — no post-processing deps)
- * and a shell of drifting particles. Everything reacts to `setLevel()`, the
- * live audio envelope pushed in by app.js.
+ * and a shell of drifting particles. The look is driven purely by state: colour
+ * and energy change only when the state does, never with the live audio.
  */
 
 import * as THREE from "three";
@@ -28,7 +28,9 @@ const STATE_COLORS = {
   offline:   "#E5726F",
 };
 
-// Per-state energy floor: how "awake" the orb looks with no audio at all.
+// Per-state energy: how "awake" the orb looks. This is the ONLY thing a state
+// changes about the animation — the motion itself (breath, spin, shader pulse)
+// is the same steady loop in every state, and nothing is driven by live audio.
 const STATE_ENERGY = {
   idle: 0.10,
   listening: 0.34,
@@ -52,8 +54,8 @@ let currentState = "idle";
 const colorCurrent = new THREE.Color(STATE_COLORS.idle);
 const colorTarget = new THREE.Color(STATE_COLORS.idle);
 
-let rawLevel = 0;      // pushed in by app.js (0..1)
-let smoothLevel = 0;   // eased, what the shaders actually see
+let rawLevel = 0;                     // live audio envelope pushed by app.js
+let smoothLevel = STATE_ENERGY.idle;  // eased, what the shaders actually see
 let energyFloor = STATE_ENERGY.idle;
 
 // ---------- Shader chunks ----------
@@ -170,10 +172,18 @@ void main() {
   float veins = smoothstep(0.20, 0.92, abs(vNoise)) * (0.22 + uLevel * 0.5);
   float pulse = 0.06 * sin(uTime * 1.7);
 
-  float e = body + rim * 1.05 + veins + uLevel * 0.30 + pulse;
+  float e = body + rim * 0.92 + veins + uLevel * 0.22 + pulse;
 
-  vec3 col = uColor * e;
-  col += vec3(1.0) * pow(rim, 2.4) * (0.16 + uLevel * 0.22);  // white-hot silhouette
+  // Hue is locked to the state. Two things used to break it:
+  //   1. adding white in proportion to uLevel — louder literally meant whiter;
+  //   2. letting uColor * e overdrive, so the brightest channel clipped at 1.0
+  //      first and dragged the hue toward white.
+  // A constant rim keeps the hot silhouette, and normalising by the peak
+  // channel keeps the R:G:B ratio — and therefore the hue — exactly fixed
+  // while energy still changes how bright the orb reads.
+  vec3 col = uColor * e + vec3(1.0) * pow(rim, 2.4) * 0.12;
+  float peak = max(col.r, max(col.g, col.b));
+  if (peak > 1.0) col /= peak;
 
   gl_FragColor = vec4(col, 1.0);
 }
@@ -198,7 +208,7 @@ uniform float uStrength;
 varying vec2 vUv;
 void main() {
   float r = length(vUv - 0.5) * 2.0;
-  float g = pow(max(0.0, 1.0 - r), uPower) * uStrength * (0.7 + uLevel * 0.6);
+  float g = pow(max(0.0, 1.0 - r), uPower) * uStrength * (0.72 + uLevel * 0.22);
   gl_FragColor = vec4(uColor * g, g);
 }
 `;
@@ -369,10 +379,13 @@ function tick() {
   const dt = Math.min(clock.getDelta(), 0.1);
   const t = clock.elapsedTime;
 
-  // Colour eases toward the active state so transitions never snap.
+  // Colour and energy ease toward the active state so a change glides rather
+  // than snapping. Between changes both are constant, so the look holds for the
+  // whole time a state lasts — no live audio feeds in anywhere.
   colorCurrent.lerp(colorTarget, 1 - Math.pow(0.0025, dt));
 
-  // Energy = state floor + live audio envelope, attack fast / release slow.
+  // Energy = state floor + live audio, attack fast / release slow. This drives
+  // motion and brightness only; hue is fixed by the state (see CORE_FRAG).
   const target = Math.min(1, energyFloor + rawLevel);
   const k = target > smoothLevel ? 1 - Math.pow(0.002, dt) : 1 - Math.pow(0.35, dt);
   smoothLevel += (target - smoothLevel) * k;
@@ -402,7 +415,8 @@ function tick() {
 // ---------- Public API ----------
 
 window.UltronOrb = {
-  /** Switch colour state: idle | listening | thinking | speaking | offline. */
+  /** Switch state: idle | listening | thinking | speaking | offline.
+   *  Colour and animation follow from the state and hold until it changes. */
   setState(name) {
     if (!STATE_COLORS[name] || name === currentState) return;
     currentState = name;
@@ -411,7 +425,9 @@ window.UltronOrb = {
   },
   get state() { return currentState; },
 
-  /** Live audio envelope, 0..1. Drives displacement, glow and particle spread. */
+  /** Live audio envelope, 0..1. Drives displacement, glow and particle spread.
+   *  It cannot alter the hue — CORE_FRAG scales the state colour rather than
+   *  mixing white into it, so louder means brighter, never whiter. */
   setLevel(v) {
     rawLevel = Math.max(0, Math.min(1, v || 0));
   },

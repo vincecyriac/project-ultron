@@ -50,6 +50,7 @@ const screenImgEl = document.getElementById("screen-img");
 const screenPlaceholder = document.getElementById("screen-placeholder");
 const screenFeedCard = document.getElementById("screen-feed-card");
 const pipStackEl = document.querySelector(".pip-stack");
+const agentRailEl = document.getElementById("agent-rail");
 
 // ---------- Orb state machine ----------
 // Priority: offline > speaking > thinking > listening > idle.
@@ -59,16 +60,34 @@ let speakingLevel = 0;      // envelope from the model's outgoing PCM
 let micLevel = 0;           // envelope from the local analyser
 let activeTools = 0;
 let connectionState = "connecting";   // connecting | online | offline
-let backendBusy = false;    // backend reported an executing/connecting status
+let backendBusy = false;      // backend reported an executing/connecting status
+let backendSpeaking = false;  // hub says a model turn is producing audio
 
 const SPEAK_HOLD_MS = 450;
 const MIC_GATE = 0.055;
+// Ultron's voice comes out of the Mac's speakers via PyAudio, which the
+// browser's echoCancellation cannot remove — it only cancels what the browser
+// itself plays. So the mic keeps hearing him for a moment after he stops, and
+// that must not be mistaken for the user talking.
+const ECHO_GUARD_MS = 1500;
 
 function resolveOrbState() {
   if (connectionState === "offline") return "offline";
-  if (performance.now() - lastAudioOutAt < SPEAK_HOLD_MS) return "speaking";
+
+  const sinceAudio = performance.now() - lastAudioOutAt;
+
+  // The hub knows when a model turn is producing audio and tells us; trust that
+  // over guessing from chunk arrival. A natural pause longer than SPEAK_HOLD_MS
+  // used to drop the orb out of "speaking" mid-answer, and with his own voice in
+  // the mic it landed on "listening" — a 90 degree hue jump, green to blue,
+  // while he was still talking. The timer stays as a fallback for the window
+  // before the first status arrives.
+  if (backendSpeaking || isVoicePlaying() || sinceAudio < SPEAK_HOLD_MS) return "speaking";
+
   if (activeTools > 0 || backendBusy) return "thinking";
-  if (!isMicMuted && micLevel > MIC_GATE) return "listening";
+  const sinceVoiceEnded = performance.now() - playbackCursorMs;
+  if (!isMicMuted && micLevel > MIC_GATE
+      && sinceAudio > ECHO_GUARD_MS && sinceVoiceEnded > ECHO_GUARD_MS) return "listening";
   return "idle";
 }
 
@@ -91,23 +110,37 @@ function pumpOrb() {
     micLevel *= 0.85;
   }
 
-  speakingLevel *= 0.90;
+  // Drop chunks that have finished playing; the head of the queue is the audio
+  // audible right now, so the orb animates in step with what you actually hear.
+  const nowMs = performance.now();
+  while (audioSchedule.length && audioSchedule[0].untilMs <= nowMs) audioSchedule.shift();
+  const heardRms = audioSchedule.length ? audioSchedule[0].rms : 0;
+  speakingLevel += (heardRms - speakingLevel) * (heardRms > speakingLevel ? 0.45 : 0.12);
 
   const state = resolveOrbState();
   orb.setState(state);
 
+  // Feed the live envelope back in: it animates the orb without touching hue.
   if (state === "speaking") orb.setLevel(Math.min(1, speakingLevel * 2.2));
   else if (state === "listening") orb.setLevel(Math.min(1, micLevel * 1.8));
   else if (state === "thinking") orb.setLevel(0.12 + Math.abs(Math.sin(performance.now() / 520)) * 0.20);
   else orb.setLevel(micLevel * 0.6);
 }
 
-/** RMS of a base64 PCM16 chunk, sampled sparsely — cheap enough per chunk. */
-function pcmRms(b64) {
+// The hub streams Ultron's voice as fast as the model generates it — measured
+// at ~35s of speech delivered in under 10s. Animating on arrival therefore ran
+// the orb dry while he was still audibly talking. Instead every chunk is placed
+// on a playback timeline and the orb reads whichever chunk is *being heard now*.
+const AUDIO_SR = 24000;
+let playbackCursorMs = 0;      // when the queued audio runs out
+const audioSchedule = [];      // { untilMs, rms } in playback order
+
+/** RMS + duration of a base64 PCM16 chunk, sampled sparsely. */
+function pcmStats(b64) {
   try {
     const raw = window.atob(b64);
     const n = (raw.length / 2) | 0;
-    if (!n) return 0;
+    if (!n) return { rms: 0, durationMs: 0 };
     const step = Math.max(1, Math.floor(n / 128));
     let sum = 0;
     let count = 0;
@@ -118,10 +151,29 @@ function pcmRms(b64) {
       sum += v * v;
       count++;
     }
-    return Math.sqrt(sum / count);
+    return { rms: Math.sqrt(sum / count), durationMs: (n / AUDIO_SR) * 1000 };
   } catch (_) {
-    return 0;
+    return { rms: 0, durationMs: 0 };
   }
+}
+
+function scheduleAudioChunk(b64) {
+  const { rms, durationMs } = pcmStats(b64);
+  if (!durationMs) return;
+  const now = performance.now();
+  if (playbackCursorMs < now) playbackCursorMs = now;   // fresh utterance
+  playbackCursorMs += durationMs;
+  audioSchedule.push({ untilMs: playbackCursorMs, rms });
+}
+
+function clearAudioSchedule() {
+  audioSchedule.length = 0;
+  playbackCursorMs = 0;
+}
+
+/** True while there is still queued voice being heard. */
+function isVoicePlaying() {
+  return performance.now() < playbackCursorMs;
 }
 
 // ---------- Telemetry ----------
@@ -141,6 +193,57 @@ function applyTelemetry(msg) {
     teleRamEl.textContent = `RAM ${msg.mem_used_gb.toFixed(1)}/${Math.round(msg.mem_total_gb)} GB`;
     teleRamEl.classList.toggle("warm", msg.mem_used_gb / msg.mem_total_gb >= 0.9);
   }
+}
+
+// ---------- Background agent chips ----------
+// The hub broadcasts tool_activity with name "agent:<tier>" when a sub-agent
+// starts and finishes; each one gets a chip so long-running work is visible.
+
+const AGENT_LABELS = { os: "OS agent", spatial: "Spatial agent" };
+const agentChips = new Map();
+
+function agentStart(tier, goal) {
+  let chip = agentChips.get(tier);
+  if (!chip) {
+    chip = document.createElement("div");
+    chip.className = "agent-chip";
+    chip.innerHTML = '<span class="agent-spinner"></span>'
+      + '<span class="agent-name"></span><span class="agent-goal"></span>';
+    agentRailEl.appendChild(chip);
+    agentChips.set(tier, chip);
+  }
+  clearTimeout(chip._removeTimer);
+  chip.classList.remove("done");
+  chip.querySelector(".agent-name").textContent = AGENT_LABELS[tier] || tier;
+  chip.querySelector(".agent-goal").textContent = goal ? `· ${goal}` : "";
+}
+
+// A momentary WS drop (session rotation, reload) shouldn't wipe the status of
+// agents that are still running on the backend; only a sustained outage does.
+let agentClearTimer = null;
+
+function scheduleAgentChipClear() {
+  clearTimeout(agentClearTimer);
+  agentClearTimer = setTimeout(() => {
+    agentChips.forEach((chip) => chip.remove());
+    agentChips.clear();
+  }, 8000);
+}
+
+function cancelAgentChipClear() {
+  clearTimeout(agentClearTimer);
+  agentClearTimer = null;
+}
+
+function agentDone(tier, result) {
+  const chip = agentChips.get(tier);
+  if (!chip) return;
+  chip.querySelector(".agent-goal").textContent = result ? `· ${result.slice(0, 60)}` : "· done";
+  chip.classList.add("done");
+  chip._removeTimer = setTimeout(() => {
+    chip.remove();
+    agentChips.delete(tier);
+  }, 600);
 }
 
 // ---------- Caption ----------
@@ -167,6 +270,7 @@ function initWebSocket() {
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
+    cancelAgentChipClear();
     connectionState = "online";
     backendBusy = false;
     ws.send(JSON.stringify({ type: "client_hello", remote: IS_REMOTE }));
@@ -184,7 +288,9 @@ function initWebSocket() {
   ws.onclose = () => {
     connectionState = "offline";
     backendBusy = false;
+    backendSpeaking = false;
     activeTools = 0;
+    scheduleAgentChipClear();
     setTimeout(initWebSocket, 3000);
   };
 }
@@ -199,7 +305,7 @@ function handleServerMessage(msg) {
       lastAudioOutAt = performance.now();
       backendBusy = false;
       if (msg.pcm_base64) {
-        speakingLevel = Math.max(speakingLevel, pcmRms(msg.pcm_base64));
+        scheduleAudioChunk(msg.pcm_base64);
         if (IS_REMOTE) playPcmChunk(msg.pcm_base64);
       }
       break;
@@ -248,18 +354,27 @@ function handleServerMessage(msg) {
       updateSenseState(msg.camera_active, msg.screen_active);
       break;
 
-    case "tool_activity":
-      if (msg.phase === "start") activeTools++;
-      else if (msg.phase === "done") activeTools = Math.max(0, activeTools - 1);
+    case "tool_activity": {
+      const agentTier = msg.name && msg.name.startsWith("agent:") ? msg.name.slice(6) : null;
+      if (msg.phase === "start") {
+        activeTools++;
+        if (agentTier) agentStart(agentTier, msg.args_preview);
+      } else if (msg.phase === "done") {
+        activeTools = Math.max(0, activeTools - 1);
+        if (agentTier) agentDone(agentTier, msg.result_preview);
+      }
       break;
+    }
 
     case "system_telemetry":
       applyTelemetry(msg);
       break;
 
     case "interrupted":
+      backendSpeaking = false;
       lastAudioOutAt = 0;
       speakingLevel = 0;
+      clearAudioSchedule();
       flushPlayback();
       break;
   }
@@ -274,9 +389,15 @@ function updateStatus(status) {
     connectionState = "online";
     backendBusy = s.includes("executing") || s.includes("connecting") || s.includes("resuming");
   }
+  // "Speaking" is emitted per audio part; "Listening" lands on turn_complete;
+  // "Listening (Interrupted)" on barge-in — all three settle the turn state.
+  if (s.includes("speaking")) backendSpeaking = true;
+  else if (s.includes("listening") || s.includes("interrupted")) backendSpeaking = false;
+
   if (s.includes("interrupted")) {
     lastAudioOutAt = 0;
     speakingLevel = 0;
+    clearAudioSchedule();
   }
 }
 
@@ -654,8 +775,10 @@ orbStageEl.addEventListener("click", () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "interrupt" }));
   }
+  backendSpeaking = false;
   lastAudioOutAt = 0;
   speakingLevel = 0;
+  clearAudioSchedule();
   flushPlayback();
 });
 

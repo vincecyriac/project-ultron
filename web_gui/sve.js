@@ -106,27 +106,123 @@ function makeMaterial(spec) {
   return mat;
 }
 
+// Labels are drawn at a constant *screen* size (see updateLabels) rather than a
+// fixed world size — a fixed size made a long name physically larger than the
+// model it named, which buried the scene under overlapping text.
+const LABEL_PX = 15;          // on-screen cap height
+const LABEL_MAX_VISIBLE = 12; // declutter budget per frame
+const LABEL_PAD_PX = 4;       // gap required between two labels
+
 function makeLabelSprite(text, color = "#ffffff") {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
-  const font = "500 26px Inter, sans-serif";
+  const fontPx = 26;
+  const font = `500 ${fontPx}px Inter, sans-serif`;
   ctx.font = font;
   const w = Math.ceil(ctx.measureText(text).width) + 26;
-  canvas.width = w; canvas.height = 46;
+  const h = 46;
+
+  canvas.width = Math.ceil(w * dpr);
+  canvas.height = Math.ceil(h * dpr);
+  ctx.scale(dpr, dpr);
   ctx.font = font;
-  ctx.fillStyle = "rgba(10,12,16,0.72)";
+  ctx.fillStyle = "rgba(7,10,15,0.78)";
   ctx.beginPath();
-  ctx.roundRect(0, 0, w, 46, 10);
+  ctx.roundRect(0, 0, w, h, 10);
   ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.10)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(0.5, 0.5, w - 1, h - 1, 10);
+  ctx.stroke();
   ctx.fillStyle = color;
   ctx.textBaseline = "middle";
-  ctx.fillText(text, 13, 24);
+  ctx.fillText(text, 13, h / 2);
+
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false }));
-  sprite.scale.set(w / 110, 46 / 110, 1);
+  tex.minFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex,
+    // Occluded by geometry like a real annotation, but never writes depth.
+    depthTest: true,
+    depthWrite: false,
+    transparent: true,
+  }));
   sprite.userData.isLabel = true;
+  sprite.userData.aspect = w / h;   // used to size it in world units each frame
+  sprite.renderOrder = 10;
   return sprite;
+}
+
+// ---------- Per-frame label sizing + decluttering ----------
+
+const _lblPos = new THREE.Vector3();
+const _lblScale = new THREE.Vector3();
+const _lblProj = new THREE.Vector3();
+
+function updateLabels(entry) {
+  if (!camera || !renderer) return;
+
+  const size = renderer.getSize(new THREE.Vector2());
+  if (!size.y) return;
+  // World units per screen pixel at a given depth, for this camera.
+  const unitsPerPixel = (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)) / size.y;
+
+  const found = [];
+  entry.three.traverse((o) => {
+    if (!o.userData.isLabel) return;
+    const owner = o.parent;
+    if (!owner || !owner.visible) { o.visible = false; return; }
+    o.getWorldPosition(_lblPos);
+    found.push({ sprite: o, owner, dist: _lblPos.distanceTo(camera.position), world: _lblPos.clone() });
+  });
+  if (!found.length) return;
+
+  // The selected object always keeps its label; everything else competes.
+  const selected = entry.selectedObj;
+  found.sort((a, b) => {
+    const as = selected && (a.owner === selected) ? -1 : 0;
+    const bs = selected && (b.owner === selected) ? -1 : 0;
+    return (as - bs) || (a.dist - b.dist);
+  });
+
+  const placed = [];
+  for (const item of found) {
+    const { sprite, dist, world } = item;
+
+    // Constant on-screen size regardless of depth...
+    const worldH = LABEL_PX * unitsPerPixel * dist;
+    const worldW = worldH * sprite.userData.aspect;
+    // ...and immune to whatever scale the parent object carries.
+    sprite.parent.getWorldScale(_lblScale);
+    sprite.scale.set(
+      worldW / (_lblScale.x || 1),
+      worldH / (_lblScale.y || 1),
+      1
+    );
+
+    _lblProj.copy(world).project(camera);
+    if (_lblProj.z > 1) { sprite.visible = false; continue; }   // behind the camera
+
+    const cx = (_lblProj.x * 0.5 + 0.5) * size.x;
+    const cy = (-_lblProj.y * 0.5 + 0.5) * size.y;
+    const halfW = (LABEL_PX * sprite.userData.aspect) / 2 + LABEL_PAD_PX;
+    const halfH = LABEL_PX / 2 + LABEL_PAD_PX;
+
+    const clash = placed.some((r) =>
+      Math.abs(r.cx - cx) < (r.halfW + halfW) && Math.abs(r.cy - cy) < (r.halfH + halfH));
+
+    if (clash || placed.length >= LABEL_MAX_VISIBLE) {
+      sprite.visible = false;
+    } else {
+      sprite.visible = true;
+      placed.push({ cx, cy, halfW, halfH });
+    }
+  }
 }
 
 function buildObject(spec) {
@@ -176,7 +272,10 @@ function buildObject(spec) {
   if (spec.label && spec.type !== "text") {
     const sprite = makeLabelSprite(spec.label);
     const bbox = new THREE.Box3().setFromObject(obj);
-    sprite.position.y = (bbox.max.y - obj.position.y) + 0.55;
+    const height = Math.max(1e-3, bbox.max.y - bbox.min.y);
+    // Sit just above the object, scaled to it — a fixed offset floated small
+    // parts' labels far away and buried big ones inside the mesh.
+    sprite.position.y = (bbox.max.y - obj.position.y) + height * 0.12 + 0.05;
     obj.add(sprite);
   }
   if (spec.highlighted) applyHighlight(obj, true);
@@ -477,6 +576,7 @@ function tick() {
     }
   });
 
+  updateLabels(entry);
   renderer.render(entry.three, camera);
 }
 
