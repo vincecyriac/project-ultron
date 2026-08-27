@@ -13,7 +13,7 @@
 
 - 🎙️ **Real-Time Voice Streaming** — Full-duplex conversational audio over the Gemini Live WebSocket API (`gemini-3.1-flash-live-preview`), 16 kHz PCM in / 24 kHz out, with natural barge-in. Deep, grounded **Charon** voice by default.
 - 🔮 **Ambient Holographic Orb** — A Three.js plasma core that *is* the status display. Colour is bound to state and holds steady until the state changes; motion reacts to what you actually hear.
-- 🧩 **Composable Widget Deck** — The assistant builds cards out of declarative UI primitives (`hero_stat`, `chart_svg`, `metric_grid`, `feed_list`, `media_view`, `progress_gauge`, `web_frame`) and stacks them newest-first beside the orb.
+- 🧩 **Async Widget Deck** — Asking for data mounts a shimmering skeleton card *instantly*; a background generator writes the finished HTML — hero figures, inline SVG charts, metric matrices — and it hydrates in place a few seconds later. The voice never waits on layout.
 - 🤖 **Tiered Background Agents** — Live stays responsive for barge-in and dispatches multi-step work to specialised models: **Gemini 3.1 Pro** for macOS automation, **Gemini 3.7 Flash** for spatial scene generation.
 - 🌐 **Spatial Visualization Engine (SVE)** — Live, persistent, interactive 3D scene graphs in Three.js with object-level delta updates and local MediaPipe hand-gesture control.
 - 🖥️ **Multi-Monitor Vision & OS Automation** — Quartz display enumeration, context-aware capture, and hardware-level `CGEvent` mouse/keyboard injection across every display.
@@ -113,8 +113,8 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 │ • sentry_vision  │ │ • os tier        │ │   SceneGraph deltas  │ │   YuNet + SFace 128-d│
 │ • sentry_action  │ │   Gemini 3.1 Pro │ │ • web_gui/sve.js     │ │   Mel MFCC voice     │
 │ • sentry_exec    │ │ • spatial tier   │ │   Three.js renderer  │ │ • ultron_memory.json │
-│ • sentry_personal│ │   Gemini 3.7 Fl. │ │ • web_gui/gestures.js│ │   Persistent facts   │
-│ • sentry_web     │ │                  │ │   MediaPipe hands    │ │                      │
+│ • sentry_personal│ │ • widget writer  │ │ • web_gui/gestures.js│ │   Persistent facts   │
+│ • sentry_web     │ │   Gemini 3.7 Fl. │ │   MediaPipe hands    │ │                      │
 └──────────────────┘ └──────────────────┘ └──────────────────────┘ └──────────────────────┘
 ```
 
@@ -135,13 +135,38 @@ Live must stay free for barge-in, so anything multi-step is dispatched off the a
 |---|---|---|
 | `os` | `gemini-3.1-pro-preview` | macOS automation, AppleScript/shell chains, GUI operation |
 | `spatial` | `gemini-3.7-flash` | Building and editing 3D SVE scenes |
+| widget generator | `gemini-3.7-flash` | Writing card HTML (see below) |
 
 Agents reuse the hub's own tool implementations, run up to 12 tool round-trips, and report back a single spoken sentence. Results are **queued for a gap in the conversation** — a finished agent can never cut Ultron off mid-sentence.
 
-### 3. Widget Deck (`ultron_hub.py`, `web_gui/app.js`)
-The hub owns the authoritative deck (max 8 cards, 12 components each) and broadcasts `widget_action` events; a client connecting late receives a full `sync` snapshot. Cards are keyed by a stable `widget_id`, so repeat calls patch in place rather than piling up.
+### 3. Async Widget Deck (`ultron_hub.py`, `widget_generator_agent.py`, `web_gui/app.js`)
 
-Clicks flow back: dismissing a card tells the hub, so the model's view never drifts from yours.
+Composing a data-dense card takes seconds. Doing that inside the voice turn would stall the conversation, so the work is split in two:
+
+```
+  user speaks
+       │
+       ▼
+  Gemini Live ──► speaks the takeaway (1-2 sentences)
+       │
+       └──► create_skeleton_widget(widget_id, title, query_context)   returns in ~0ms
+                    │
+                    ├──► broadcast "create_skeleton"  → card appears, shimmering
+                    │
+                    └──► background task: gemini-3.7-flash writes the card HTML
+                                  │
+                                  ▼
+                         broadcast "patch_content"   → skeleton fades, card hydrates
+```
+
+Measured end to end: the tool returns at **+0.00s**, the skeleton is on screen in the same frame, and content patches in at **~4–12s** depending on whether the generator needs to search for live figures.
+
+- **The hub owns the deck** (max 8 cards). A client connecting late gets a full `sync` snapshot; a card dismissed mid-generation is never patched.
+- **`query_context` is the contract.** The generator cannot see the conversation — it receives only that string, so Live is instructed to spell out every figure and section the card should carry.
+- **Everything generated is sanitised before it reaches the DOM.** `<script>`, `<iframe>`, `<style>`, `<link>`, inline `on*` handlers and `javascript:` URLs are stripped hub-side. The generator is *told* not to emit them; the sanitiser is what guarantees it.
+- **The generator writes no CSS.** It composes from a fixed set of `hud-*` classes defined in `style.css`, which is what keeps model-authored markup looking like the rest of the app.
+- **Charts are earned, not decorative.** One is drawn only when there is a genuine series over time or a set of comparable magnitudes. A quote card gets a chart; a headlines card, a password or a weather summary does not.
+- **Images are fetched, verified, then proxied.** Two failure modes are real and both were observed: a model reconstructing a plausible CDN path that answers `401`, and a genuine article image that answers `403` to a direct browser request because of hotlink protection. So the hub fetches each candidate itself with a browser user-agent and the image's own origin as `Referer`, drops whatever cannot be retrieved, and rewrites the survivors to `/img?u=…` — a local endpoint that streams the bytes from the hub. The browser only ever loads images from localhost, and a card never shows a broken frame.
 
 ### 4. Multi-Monitor Vision & Spatial Targeting (`sentry_vision.py`)
 - **Quartz display enumeration** — all monitors, scaling factors, desktop arrangement.
@@ -175,27 +200,25 @@ Clicks flow back: dismissing a card tells the hub, so the model's view never dri
 
 ---
 
-## 🧱 Widget Component Reference
+## 🧱 Card Design Tokens
 
-A card is a title plus an ordered array of primitives, rendered top to bottom.
+The generator is given this vocabulary and nothing else — no `<style>` blocks, no invented colours. Every class below is defined in `web_gui/style.css`:
 
-| Component | Renders |
+| Class | Renders |
 |---|---|
-| `hero_stat` | Headline figure, subtitle, market tag, colour-coded delta badge, timestamp |
-| `chart_svg` | Auto-scaling gradient area chart, glowing stroke, dashed baseline reference, axis bounds and time markers |
-| `metric_grid` | Dense 2–4 column label/value matrix (Open, High, Low, Mkt Cap, P/E, 52W range, Div Yield…) |
-| `feed_list` | Numbered intelligence items with category badges, bold headlines, briefs, timestamps |
-| `media_view` | Image URL or inline SVG inside corner-HUD framing, with a graceful failure state |
-| `progress_gauge` | Linear meters or radial dials with warm/hot thresholds |
-| `web_frame` | Live embedded page with a browser HUD (back / forward / reload / URL pill / open externally) |
+| `.hud-hero-stat` / `.hud-hero-row` / `.hud-sub` | Large monospace headline figure with a glowing accent, its label and caption |
+| `.hud-badge-green` / `-red` / `-cyan` / `-amber` | Delta and status pills |
+| `.hud-metric-grid` + `.hud-metric` | Three-column key/value matrix |
+| `.hud-feed` + `.hud-feed-row` | Numbered rows with category tag, headline and brief |
+| `.hud-svg-chart` | Wrapper for an inline `<svg viewBox="0 0 400 120">` — gradient area fill, glowing stroke, dashed reference line |
+| `.hud-bar` | Linear meter |
+| `.hud-note` | Closing one- or two-line summary |
 
-`web_frame` is header-aware: the hub probes `X-Frame-Options` and `Content-Security-Policy: frame-ancestors` server-side — the browser cannot see a framing refusal cross-origin — and a site that refuses embedding shows a launch button instead of a blank frame.
-
----
+Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs and images inside `.hud` are given baseline styling rather than inheriting browser defaults.
 
 ## 🛠️ Tool Registry
 
-**35 native tool functions** exposed to the model:
+**34 native tool functions** exposed to the model:
 
 | Category | Tools |
 |---|---|
@@ -203,7 +226,7 @@ A card is a title plus an ordered array of primitives, rendered top to bottom.
 | **Vision & Sensors** | `look_at_screen`, `look_at_webcam`, `start_camera_stream`, `stop_camera_stream`, `start_screen_stream`, `stop_screen_stream` |
 | **Biometrics & Memory** | `register_person`, `identify_current_user`, `save_memory_fact`, `retrieve_memory_facts` |
 | **Spatial 3D Engine** | `create_3d_scene`, `update_3d_scene`, `inspect_3d_scene`, `list_3d_scenes`, `delete_3d_scene` |
-| **Widget Deck** | `create_widget`, `update_widget`, `dismiss_widget`, `clear_all_widgets` |
+| **Widget Deck** | `create_skeleton_widget`, `dismiss_widget`, `clear_all_widgets` |
 | **Delegation** | `dispatch_agent` |
 | **Productivity & Web** | `get_calendar_events`, `create_calendar_event`, `get_recent_emails`, `search_emails`, `fetch_webpage` |
 | **System Lifecycle** | `shutdown_ultron` |
@@ -213,7 +236,7 @@ A card is a title plus an ordered array of primitives, rendered top to bottom.
 ## 💻 Tech Stack
 
 - **Core Runtime** — Python 3.10+ (asyncio, websockets, PyAudio, aiohttp, psutil)
-- **AI Models** — Google Gemini via `google-genai`: Live `3.1-flash-live-preview`, agents `3.1-pro-preview` and `3.7-flash`
+- **AI Models** — Google Gemini via `google-genai`: Live `3.1-flash-live-preview`, agents and widget generator `3.1-pro-preview` / `3.7-flash`
 - **macOS Native APIs** — PyObjC (Quartz CoreGraphics, EventKit, Foundation, WebKit), AppleScript
 - **Computer Vision & Biometrics** — OpenCV, ONNX (YuNet, SFace), NumPy, Pillow
 - **Frontend** — Vanilla JS + CSS, custom GLSL shaders, Three.js, MediaPipe HandLandmarker (WASM)
@@ -310,6 +333,7 @@ Reset sharing with `tailscale serve reset`.
 project_ultron/
 ├── ultron_hub.py              # Async hub: audio, WebSocket, Live session, widget deck
 ├── ultron_agents.py           # Background agent tiers (os / spatial) and their tool loop
+├── widget_generator_agent.py  # Card HTML synthesis + output sanitiser
 ├── app_desktop.py             # PyWebView desktop shell + process lifecycle
 ├── sentry_vision.py           # Quartz multi-monitor capture & coordinate tracking
 ├── sentry_action.py           # CGEvent mouse/keyboard automation & click mapping

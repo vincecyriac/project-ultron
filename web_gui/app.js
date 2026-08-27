@@ -205,7 +205,7 @@ function applyTelemetry(msg) {
 // The hub broadcasts tool_activity with name "agent:<tier>" when a sub-agent
 // starts and finishes; each one gets a chip so long-running work is visible.
 
-const AGENT_LABELS = { os: "OS agent", spatial: "Spatial agent" };
+const AGENT_LABELS = { os: "OS agent", spatial: "Spatial agent", widget: "Building card" };
 const agentChips = new Map();
 
 function agentStart(tier, goal) {
@@ -385,6 +385,13 @@ function handleServerMessage(msg) {
           (msg.widgets || []).slice().reverse().forEach(mountWidget);
           break;
         case "create":  mountWidget(msg.widget); break;
+        case "create_skeleton":
+          mountWidget({ id: msg.widget_id, type: "html", title: msg.title,
+                        status: "loading", html: "", components: [] });
+          break;
+        case "patch_content":
+          hydrateWidget(msg.widget_id, msg.html, msg.status);
+          break;
         case "update":  patchWidget(msg.widget_id, msg.components); break;
         case "dismiss": dismissWidgetLocal(msg.widget_id); break;
         case "clear_all": clearAllWidgetsLocal(); break;
@@ -443,6 +450,7 @@ const COMPONENT_ICONS = {
 
 function widgetIcon(spec) {
   if (spec.type === "3d_spatial") return COMPONENT_ICONS["3d_spatial"];
+  if (spec.type === "html") return COMPONENT_ICONS.metric_grid;
   const first = (spec.components || [])[0];
   return COMPONENT_ICONS[first && first.type] || COMPONENT_ICONS.feed_list;
 }
@@ -520,6 +528,50 @@ function sendWidgetAction(tool, args) {
   }
 }
 
+// ---------- Skeleton + hydration ----------
+// The card is mounted the instant Vince asks; a sub-agent fills it a few
+// seconds later. The shimmer stands in for the shape the finished card will
+// take — a hero figure, a chart, a metric row — so the swap is not a jolt.
+
+function skeletonMarkup() {
+  return '<div class="widget-skeleton-body">'
+    + '<div class="skeleton-shimmer skeleton-hero"></div>'
+    + '<div class="skeleton-shimmer skeleton-chart"></div>'
+    + '<div class="skeleton-shimmer skeleton-grid"></div>'
+    + '<div class="skeleton-shimmer skeleton-line"></div>'
+    + '</div>';
+}
+
+function hydrateWidget(id, html, status) {
+  const entry = widgets.get(id);
+  if (!entry) return;
+  entry.spec.html = html || "";
+  entry.spec.status = status || "ready";
+  entry.spec.type = "html";
+
+  const body = entry.el.querySelector(".widget-body");
+  const skeleton = body.querySelector(".widget-skeleton-body");
+
+  const swap = () => {
+    body.innerHTML = `<div class="hud">${entry.spec.html}</div>`;
+    entry.el.classList.remove("loading");
+    entry.el.classList.toggle("failed", entry.spec.status === "failed");
+    const hud = body.firstElementChild;
+    if (hud) {
+      hud.classList.add("hud-in");
+      // Charts arriving late change the card's height; keep the deck settled.
+      requestAnimationFrame(() => pumpRenderers(120));
+    }
+  };
+
+  if (skeleton) {
+    skeleton.classList.add("fading");
+    setTimeout(swap, 200);
+  } else {
+    swap();
+  }
+}
+
 // ---------- Component pipeline ----------
 // A widget is a title plus an ordered array of declarative primitives. Each
 // renderer takes one primitive and returns HTML; the card is their concatenation,
@@ -538,6 +590,19 @@ const COMPONENTS = {
 function renderWidgetBody(entry) {
   const body = entry.el.querySelector(".widget-body");
   if (entry.spec.type === "3d_spatial") { adoptSveStage(body); return; }
+
+  // Cards built by the background generator arrive as markup, and start life as
+  // a shimmer so the deck responds the moment Vince asks rather than seconds later.
+  if (entry.spec.type === "html") {
+    if (entry.spec.status === "loading") {
+      body.innerHTML = skeletonMarkup();
+      entry.el.classList.add("loading");
+    } else {
+      body.innerHTML = `<div class="hud">${entry.spec.html || ""}</div>`;
+      entry.el.classList.remove("loading");
+    }
+    return;
+  }
 
   const list = Array.isArray(entry.spec.components) ? entry.spec.components : [];
   const html = list.map((c, i) => {
@@ -932,6 +997,16 @@ function pumpRenderers(durationMs = 720) {
     if (performance.now() < until) resizePump = requestAnimationFrame(step);
   };
   step();
+}
+
+// The telemetry HUD wraps to two lines once the rail is active, so the agent
+// chips below it have to follow its real height rather than a fixed offset.
+const telemetryEl = document.querySelector(".telemetry");
+if (telemetryEl) {
+  new ResizeObserver(() => {
+    const h = telemetryEl.getBoundingClientRect().height;
+    document.documentElement.style.setProperty("--telemetry-h", `${Math.round(h)}px`);
+  }).observe(telemetryEl);
 }
 
 // Feed stack height feeds the rail layout so the command pill never rides

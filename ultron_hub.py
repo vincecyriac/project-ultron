@@ -37,6 +37,7 @@ import sentry_web
 import sentry_personal
 import sentry_scene
 import ultron_agents
+import widget_generator_agent
 
 # Load environment variables
 load_dotenv()
@@ -815,6 +816,79 @@ async def update_widget(widget_id: str, components) -> str:
     return f"Widget '{widget['title']}' updated."
 
 
+def create_skeleton_widget(widget_id: str, title: str, query_context: str) -> str:
+    """Mount an empty card immediately, then fill it from a sub-agent.
+
+    Live must not be blocked composing markup — it names what it wants and gets
+    straight back to the conversation. The card appears within a frame, shows a
+    shimmer, and hydrates when the generator returns.
+    """
+    widget_id = (widget_id or "").strip() or f"w_{uuid.uuid4().hex[:6]}"
+    title = (title or widget_id).strip()
+    query_context = (query_context or "").strip()
+    if not query_context:
+        return "Tell me what the card should show — I need the details to build it."
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    widget = {"id": widget_id, "type": "html", "title": title,
+              "status": "loading", "html": "", "components": []}
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create_skeleton",
+                     "widget_id": widget_id, "title": title})
+
+    task = asyncio.create_task(_hydrate_widget(widget_id, title, query_context))
+    active_agent_tasks.add(task)
+    task.add_done_callback(active_agent_tasks.discard)
+
+    log_info(f"Skeleton mounted '{title}' — generating content in the background.")
+    return ("Card is on screen and filling in. Say one or two sentences now giving "
+            "Vince the takeaway; do not wait for it to finish.")
+
+
+async def _hydrate_widget(widget_id: str, title: str, query_context: str):
+    """Generate the card body and patch it in. Never raises into the task."""
+    broadcast_event({"type": "tool_activity", "phase": "start",
+                     "name": "agent:widget", "args_preview": title})
+    html = ""
+    error = ""
+    try:
+        html = await widget_generator_agent.generate_widget_html(
+            genai_client, title, query_context)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        error = str(e)
+        log_info(f"Widget generation failed for '{title}': {e}")
+
+    widget = active_widgets.get(widget_id)
+    if widget is None:          # dismissed while it was still generating
+        broadcast_event({"type": "tool_activity", "phase": "done",
+                         "name": "agent:widget", "result_preview": "dismissed"})
+        return
+
+    if not html:
+        html = ('<div class="hud-note">Could not build this card'
+                + (f' — {esc_html(error)}' if error else '') + '.</div>')
+        widget["status"] = "failed"
+    else:
+        widget["status"] = "ready"
+    widget["html"] = html
+
+    broadcast_event({"type": "widget_action", "action": "patch_content",
+                     "widget_id": widget_id, "html": html,
+                     "status": widget["status"]})
+    broadcast_event({"type": "tool_activity", "phase": "done",
+                     "name": "agent:widget",
+                     "result_preview": f"{title}: {len(html)} bytes"})
+    log_info(f"Widget '{title}' hydrated ({len(html)} bytes).")
+
+
+def esc_html(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 def dismiss_widget(widget_id: str) -> str:
     widget = active_widgets.pop(widget_id, None)
     if not widget:
@@ -1074,11 +1148,9 @@ async def execute_tool(name: str, args: dict) -> tuple:
             None, sentry_personal.search_emails,
             args.get("query", ""), int(args.get("count", 8))
         )
-    elif name == "create_widget":
-        result = await create_widget(args.get("widget_id", ""), args.get("title", ""),
-                                     args.get("components"), args.get("widget_type", ""))
-    elif name == "update_widget":
-        result = await update_widget(args.get("widget_id", ""), args.get("components"))
+    elif name == "create_skeleton_widget":
+        result = create_skeleton_widget(args.get("widget_id", ""), args.get("title", ""),
+                                        args.get("query_context", ""))
     elif name == "dismiss_widget":
         result = dismiss_widget(args.get("widget_id", ""))
     elif name == "clear_all_widgets":
@@ -1449,52 +1521,39 @@ TOOL_FUNCTION_DECLARATIONS = [
                         }
                     },
                     {
-                        "name": "create_widget",
+                        "name": "create_skeleton_widget",
                         "description": (
-                            "Mount a data-dense card on the GUI deck. Use this for ANY answer "
-                            "carrying detail worth seeing, instead of reading it aloud. Compose the "
-                            "card from an array of UI primitives — a rich card usually has three to "
-                            "five. Reuse a stable widget_id so later calls patch the same card."
+                            "Put a data card on screen. Use this for ANY answer carrying detail "
+                            "worth seeing — a quote, machine telemetry, a research briefing, a "
+                            "comparison. It returns INSTANTLY: the card appears as a loading "
+                            "skeleton and a background generator fills it in a few seconds later. "
+                            "So call it and keep talking; never wait, and never apologise for it "
+                            "loading. Reuse a widget_id to replace that card's contents."
                         ),
                         "parameters": {
                             "type": "OBJECT",
                             "properties": {
-                                "widget_id": {"type": "STRING", "description": "Stable id, e.g. 'goog' or 'sysmon'."},
-                                "title": {"type": "STRING", "description": "Short card header, e.g. 'Alphabet Inc.'."},
-                                "components": {
+                                "widget_id": {
+                                    "type": "STRING",
+                                    "description": "Stable id for the subject, e.g. 'goog_quote' or 'sysmon'."
+                                },
+                                "title": {
+                                    "type": "STRING",
+                                    "description": "Card header, e.g. 'Alphabet Inc.'."
+                                },
+                                "query_context": {
                                     "type": "STRING",
                                     "description": (
-                                        "JSON ARRAY of UI primitives, rendered top to bottom. Be exhaustive — "
-                                        "sparse cards look broken. Shapes:\n"
-                                        "{type:'hero_stat', value:'207.42', subtitle:'USD', tag:'NASDAQ: GOOG', "
-                                        "change_percent:1.87, change_value:'+3.81', direction:'up', timestamp:'25 Aug, 10:35 GMT+4'}\n"
-                                        "{type:'chart_svg', points:[203.1,204.8,...], labels:['10:00 AM','12:00 PM','2:00 PM','4:00 PM'], "
-                                        "baseline:203.6, baseline_label:'Previous close', direction:'up'}\n"
-                                        "{type:'metric_grid', columns:3, items:[{label:'Open',value:'204.10'},{label:'High',value:'208.02'}, "
-                                        "{label:'Low',value:'203.44'},{label:'Mkt Cap',value:'2.51T'},{label:'P/E',value:'26.4'}, "
-                                        "{label:'52W High',value:'212.19'},{label:'52W Low',value:'129.40'},{label:'Div Yield',value:'0.44%'}]}\n"
-                                        "{type:'feed_list', items:[{category:'ALERT', headline:'...', brief:'...', timestamp:'10:12'}]}\n"
-                                        "{type:'media_view', url:'https://...', caption:'...'}  (or svg:'<svg .../>')\n"
-                                        "{type:'progress_gauge', style:'radial'|'linear', items:[{label:'CPU', value:38, max:100, suffix:'%'}]}\n"
-                                        "{type:'web_frame', url:'https://example.com', label:'Example'}  (live embedded page)\n"
-                                        "For finance ALWAYS give hero_stat + chart_svg points + a 6-8 cell metric_grid. "
-                                        "For news/summaries give feed_list with category tags and timestamps."
+                                        "Everything the generator needs, in detail — it cannot see the "
+                                        "conversation. Name the subject, every figure or section the card "
+                                        "should carry, and any values you already know. E.g. 'Live GOOG "
+                                        "quote: price, day change and percent, open/high/low, market cap, "
+                                        "P/E, 52-week range, intraday trend chart, one-line sentiment.' "
+                                        "Thin context makes a thin card."
                                     )
                                 }
                             },
-                            "required": ["widget_id", "title", "components"]
-                        }
-                    },
-                    {
-                        "name": "update_widget",
-                        "description": "Replace an existing card's components, keeping it mounted in place.",
-                        "parameters": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "widget_id": {"type": "STRING", "description": "The card to patch."},
-                                "components": {"type": "STRING", "description": "JSON array of UI primitives, same shapes as create_widget."}
-                            },
-                            "required": ["widget_id", "components"]
+                            "required": ["widget_id", "title", "query_context"]
                         }
                     },
                     {
@@ -1671,6 +1730,10 @@ async def receive_audio_task(session, session_disconnect_event):
         session_disconnect_event.set()
 
 
+IMAGE_MAX_BYTES = 6 * 1024 * 1024
+_image_cache = {}          # url -> (bytes, content_type)
+
+
 async def start_gui_server():
     """Serves web_gui over HTTP so ES modules (Three.js) load reliably."""
     # pyrefly: ignore [missing-import]
@@ -1680,8 +1743,51 @@ async def start_gui_server():
     async def index(request):
         return web.FileResponse(os.path.join(gui_dir, "index.html"))
 
+    async def image_proxy(request):
+        """Fetch a remote image and serve it from localhost.
+
+        News CDNs routinely answer a direct browser request with 403 hotlink
+        protection, so an <img src> pointing straight at them renders a broken
+        frame. Fetching server-side with a browser UA and the article's own
+        origin as Referer gets the bytes, and the page then loads them from us.
+        """
+        url = request.query.get("u", "")
+        if not url.lower().startswith(("http://", "https://")):
+            return web.Response(status=400, text="bad url")
+        cached = _image_cache.get(url)
+        if cached:
+            return web.Response(body=cached[0], content_type=cached[1])
+        try:
+            import aiohttp
+            from urllib.parse import urlsplit
+            origin = "{0.scheme}://{0.netloc}/".format(urlsplit(url))
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                "Referer": origin,
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+            }
+            connector = aiohttp.TCPConnector(ssl=False)
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector,
+                                             headers=headers) as session:
+                async with session.get(url) as resp:
+                    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                    if resp.status >= 400 or not ctype.startswith("image/"):
+                        return web.Response(status=404, text="not an image")
+                    body = await resp.content.read(IMAGE_MAX_BYTES + 1)
+            if len(body) > IMAGE_MAX_BYTES:
+                return web.Response(status=413, text="too large")
+            if len(_image_cache) > 60:
+                _image_cache.clear()
+            _image_cache[url] = (body, ctype)
+            return web.Response(body=body, content_type=ctype)
+        except Exception:
+            return web.Response(status=502, text="fetch failed")
+
     app = web.Application()
     app.router.add_get("/", index)
+    app.router.add_get("/img", image_proxy)
     app.router.add_static("/", path=gui_dir)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1734,30 +1840,30 @@ def build_system_instruction(memory_str: str) -> str:
         f"Persistent memory about Vince: {memory_str}. Use save_memory_fact to add to it. "
 
         # --- The widget deck -------------------------------------------------
-        "WIDGETS: The screen is a vertical deck of live cards you compose by voice, newest on "
-        "top. create_widget(widget_id, title, components) mounts one; update_widget replaces its "
-        "contents; dismiss_widget removes one; clear_all_widgets empties the deck. Reuse a stable "
-        "widget_id per subject so updates patch rather than pile up. "
+        "WIDGETS: The screen is a vertical deck of live cards, newest on top. "
+        "create_skeleton_widget(widget_id, title, query_context) puts one up. It returns "
+        "instantly — the card appears as a loading skeleton and a background generator fills "
+        "in the charts and figures a few seconds later. So call it and carry straight on "
+        "talking: never wait for it, never say it is loading, never apologise for it. "
+        "dismiss_widget removes one; clear_all_widgets empties the deck. Reuse a stable "
+        "widget_id per subject so a second ask replaces that card rather than stacking. "
 
-        "WHEN TO CREATE A WIDGET — be selective, an unwanted card is worse than none: "
-        "(1) Vince explicitly asks to see something: 'show me', 'pull up', 'display', 'open', "
-        "'bring up the website'. (2) The answer is genuinely multi-dimensional and worth seeing: "
-        "a live quote with its chart and fundamentals, per-core machine telemetry, a deep research "
-        "briefing with several sources, a 3D scene, or a live web page. "
+        "WHEN TO PUT A CARD UP — be selective, an unwanted card is worse than none: "
+        "(1) Vince explicitly asks to see something: 'show me', 'pull up', 'display', 'open'. "
+        "(2) The answer is genuinely multi-dimensional and worth seeing: a live quote with its "
+        "chart and fundamentals, machine telemetry, a research briefing with several sources, a "
+        "comparison. "
         "WHEN NOT TO: general questions, banter, 'what can you do', a single fact, a yes/no, a "
-        "quick lookup, anything you can answer in a sentence. Those are voice only — creating a "
-        "card for them clutters his screen. If in doubt, just answer. "
+        "quick lookup, anything you can answer in a sentence. Those are voice only. If in "
+        "doubt, just answer. "
 
-        "DATA-DENSE WIDGET RULE: when you do build one, be exhaustive — a card with one component "
-        "looks broken, three to five is normal. Components render top to bottom: hero_stat "
-        "(headline figure, delta badge, tag, timestamp), chart_svg (time-series points, axis "
-        "labels, baseline), metric_grid (6-8 label/value cells), feed_list (numbered items with "
-        "category tags, headlines, briefs, timestamps), media_view (image or inline SVG), "
-        "progress_gauge (linear or radial meters), web_frame (a live embedded web page — use it "
-        "when Vince asks to open or browse a site). "
-        "For finance ALWAYS include a hero_stat, a chart_svg with real points, and a full 6-8 cell "
-        "metric_grid. For news or research use feed_list with category tags and timestamps. "
-        "Invent nothing — if you lack a figure, omit that cell rather than guessing. "
+        "WRITING query_context IS THE WHOLE JOB. The generator cannot see this conversation — "
+        "it only receives that string. Name the subject, list every figure and section the card "
+        "should carry, and include any values you already know. 'Live GOOG quote: price, day "
+        "change and percent, open/high/low, market cap, P/E ratio, 52-week range, intraday "
+        "trend chart, one-line sentiment note.' A vague context produces a thin card. "
+
+        "3D scenes are different — those still go through dispatch_agent with tier 'spatial'. "
 
         # --- Authority and safety -------------------------------------------
         "Only Vince may run OS tasks, shell commands or AppleScript. If anyone else asks, refuse "

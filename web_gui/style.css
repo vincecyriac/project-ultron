@@ -28,6 +28,7 @@
   --orb-rail-scale: 0.38;
   --orb-rail-y: 210px;       /* orb centre inside the rail */
   --pip-stack-h: 0px;        /* live height of the feed stack, set from app.js */
+  --telemetry-h: 14px;       /* live height of the HUD — it wraps in rail mode */
 
   --ease-spatial: cubic-bezier(0.16, 1, 0.3, 1);
 
@@ -104,7 +105,9 @@ body.widgets-active .tele-sep:first-of-type { display: none; }
 
 .agent-rail {
   position: fixed;
-  top: 44px;
+  /* Sits under the telemetry HUD, which wraps to two lines once the rail is
+     active — a fixed top collided with the second line. */
+  top: calc(18px + var(--telemetry-h) + 10px);
   left: var(--gutter);
   z-index: 50;
   display: flex;
@@ -514,6 +517,203 @@ body.widgets-active .workspace {
 .widget-body { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .cmp-empty { font-size: 12px; color: var(--text-faint); }
 .cmp { min-width: 0; }
+
+/* ---------- Skeleton loader ---------- */
+
+.widget-skeleton-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px 0;
+  transition: opacity 0.2s ease;
+}
+.widget-skeleton-body.fading { opacity: 0; }
+
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(0, 242, 254, 0.04) 25%,
+    rgba(0, 242, 254, 0.15) 50%,
+    rgba(0, 242, 254, 0.04) 75%
+  );
+  background-size: 200% 100%;
+  animation: hudShimmer 1.5s infinite;
+  border-radius: 6px;
+}
+
+@keyframes hudShimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.skeleton-hero  { height: 48px;  width: 58%; }
+.skeleton-chart { height: 110px; width: 100%; }
+.skeleton-grid  { height: 60px;  width: 100%; }
+.skeleton-line  { height: 14px;  width: 74%; }
+
+.widget.loading { border-color: rgba(0, 242, 254, 0.28); }
+.widget.failed  { border-color: rgba(229, 114, 111, 0.3); }
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-shimmer { animation: none; background-position: 50% 0; }
+}
+
+/* ---------- Generated card body (hud-* design tokens) ----------
+   These are the classes the widget generator is told to use. It writes no CSS
+   of its own, so everything it can emit is defined here — that is what keeps a
+   model-authored card looking like the rest of the app. */
+
+.hud { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.hud-in { animation: hud-fade 0.32s var(--ease-spatial) both; }
+@keyframes hud-fade {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.hud-hero-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+
+.hud-hero-stat {
+  font-family: var(--mono);
+  font-size: 2.1rem;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  letter-spacing: -0.01em;
+  text-shadow: 0 0 18px rgba(0, 242, 254, 0.25);
+}
+
+.hud-sub { font-family: var(--mono); font-size: 11px; color: rgba(255,255,255,0.45); }
+
+.hud-badge-green, .hud-badge-red, .hud-badge-cyan, .hud-badge-amber {
+  display: inline-block;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.hud-badge-green { color: #00FF88; background: rgba(0, 255, 136, 0.12); }
+.hud-badge-red   { color: #FF3B30; background: rgba(255, 59, 48, 0.13); }
+.hud-badge-cyan  { color: var(--cyan); background: rgba(0, 242, 254, 0.12); }
+.hud-badge-amber { color: var(--amber); background: rgba(255, 184, 0, 0.13); }
+.hud-hero-row > [class^="hud-badge"] { margin-left: auto; }
+
+.hud-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 18px;
+}
+.hud-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  min-width: 0;
+}
+.hud-metric .k {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.5);
+}
+.hud-metric .v {
+  font-family: var(--mono);
+  font-size: 14px;
+  color: #fff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hud-feed { display: flex; flex-direction: column; }
+.hud-feed-row {
+  display: flex;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+.hud-feed-row:last-child { border-bottom: none; }
+.hud-feed-row .n {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--cyan);
+  opacity: 0.55;
+  flex-shrink: 0;
+  padding-top: 2px;
+  text-shadow: 0 0 8px rgba(0, 242, 254, 0.5);
+}
+.hud-feed-row .tag {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 2px 6px;
+  background: rgba(0, 242, 254, 0.12);
+  color: var(--cyan);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+}
+.hud-feed-row b { font-size: 13.5px; font-weight: 600; color: rgba(255,255,255,0.92); }
+.hud-feed-row p { margin: 4px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--text-dim); }
+
+.hud-svg-chart { width: 100%; height: 132px; color: var(--cyan); }
+.hud-svg-chart.down { color: #FF3B30; }
+.hud-svg-chart.up   { color: #00FF88; }
+.hud-svg-chart svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.hud-svg-chart svg .line,
+.hud-svg-chart svg path[class="line"] {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+  filter: drop-shadow(0 0 6px currentColor);
+}
+.hud-svg-chart svg .ref {
+  stroke: rgba(255, 255, 255, 0.25);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+  vector-effect: non-scaling-stroke;
+}
+.hud-svg-chart svg text { fill: rgba(255,255,255,0.4); font-family: var(--mono); font-size: 10px; }
+
+.hud-bar {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.hud-bar > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, rgba(0,242,254,0.5), var(--cyan));
+  box-shadow: 0 0 10px rgba(0, 242, 254, 0.35);
+  border-radius: 3px;
+}
+
+.hud-note {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  border-top: 1px solid var(--glass-line);
+  padding-top: 9px;
+}
+
+/* Anything the generator emits that we did not anticipate still has to sit
+   sensibly rather than inherit browser defaults. */
+.hud table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+.hud th, .hud td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+.hud ul, .hud ol { margin: 0; padding-left: 18px; font-size: 13px; color: var(--text-dim); line-height: 1.55; }
+.hud h1, .hud h2, .hud h3, .hud h4 { margin: 0; font-size: 13px; font-weight: 600; color: rgba(255,255,255,0.9); }
+.hud p { margin: 0; font-size: 13px; line-height: 1.55; color: var(--text-dim); }
+.hud img { max-width: 100%; border-radius: 8px; display: block; }
+.hud a { color: var(--cyan); }
 
 /* ---------- hero_stat ---------- */
 
