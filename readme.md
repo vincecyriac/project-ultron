@@ -329,10 +329,17 @@ project_ultron/
 │   ├── sve.js                 # Three.js 3D scene graph renderer
 │   ├── gestures.js            # MediaPipe HandLandmarker gesture input
 │   └── vendor/                # Vendored Three.js & MediaPipe WASM models
-├── ultron_memory.json         # Persistent user memory facts
-├── ultron_profiles.json       # Biometric face/voice embeddings
-└── ultron_scenes.json         # Persistent 3D scene graph state
 ```
+
+**Generated at runtime, not in the repo.** These hold personal state and are git-ignored — the app creates them on first run:
+
+| File | Holds |
+|---|---|
+| `ultron_memory.json` | Persistent facts Ultron has been asked to remember |
+| `ultron_profiles.json` | Face and voice embeddings for identity recognition |
+| `ultron_scenes.json` | Saved 3D scene graphs |
+| `.session_handle.json` | Live session resumption handle |
+| `ultron_history.jsonl` | Local interaction log |
 
 ---
 
