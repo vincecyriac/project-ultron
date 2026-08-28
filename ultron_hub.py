@@ -38,6 +38,10 @@ import sentry_personal
 import sentry_scene
 import ultron_agents
 import widget_generator_agent
+import window_context
+import text_injector
+import speak_to_window_agent
+import hotkey_manager
 
 # Load environment variables
 load_dotenv()
@@ -106,6 +110,112 @@ last_focus_note = ""
 # on quit — nothing can reliably delete the file — and any age-based "crash
 # recovery" window is exactly the window in which a person quits and reopens.
 current_session_handle = None
+
+# ---------- Speak-to-Window (push-to-talk OS text injection) ----------
+#
+# Holding the global hotkey redirects the microphone away from the Live session
+# and into a one-shot transformation aimed at whatever app the user is actually
+# focused on. It is deliberately a separate path: Live would answer out loud and
+# carries the whole conversation as context, neither of which is wanted when the
+# user is dictating an edit into someone else's text field.
+
+WINDOW_VOICE_MIN_MS = 350          # below this, the key was tapped, not held
+WINDOW_VOICE_MAX_S = 30.0
+
+window_voice = {
+    "active": False,
+    "frames": bytearray(),
+    "ctx": None,
+    "started": 0.0,
+    "source": None,                # 'gui' or 'pyaudio' — never both, or audio doubles
+}
+window_hotkey = None
+
+
+def window_voice_capture(pcm: bytes, source: str):
+    """Divert a mic chunk into the push-to-talk buffer. Returns True if consumed."""
+    if not window_voice["active"]:
+        return False
+    if window_voice["source"] is None:
+        window_voice["source"] = source
+    if window_voice["source"] != source:
+        return True                # consumed, but ignored: one source only
+    if len(window_voice["frames"]) < INPUT_RATE * 2 * WINDOW_VOICE_MAX_S:
+        window_voice["frames"].extend(pcm)
+    return True
+
+
+def _window_action(state: str, app: str = "", detail: str = ""):
+    broadcast_event({"type": "window_action", "state": state, "app": app, "detail": detail})
+
+
+def start_window_voice():
+    """Hotkey pressed. Runs on the event-tap thread — no awaiting here."""
+    if window_voice["active"]:
+        return
+    ctx = window_context.get_focused_window_context()
+    window_voice.update({"active": True, "frames": bytearray(), "ctx": ctx,
+                         "started": time.time(), "source": None})
+    _window_action("recording", ctx.get("app_name", ""))
+
+
+def stop_window_voice():
+    """Hotkey released. Hands off to the loop; the tap thread must not block."""
+    if not window_voice["active"]:
+        return
+    window_voice["active"] = False
+    pcm = bytes(window_voice["frames"])
+    ctx = window_voice["ctx"] or {}
+    held_ms = (time.time() - window_voice["started"]) * 1000
+    window_voice["frames"] = bytearray()
+    if main_loop and not main_loop.is_closed():
+        main_loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(run_window_voice_action(ctx, pcm, held_ms)))
+
+
+async def run_window_voice_action(ctx: dict, pcm: bytes, held_ms: float):
+    app = ctx.get("app_name", "the focused app")
+    if held_ms < WINDOW_VOICE_MIN_MS or len(pcm) < INPUT_RATE:   # < ~0.5s of audio
+        _window_action("idle", app)
+        return
+
+    _window_action("processing", app)
+    result = await speak_to_window_agent.process_window_voice_action(
+        genai_client, app, ctx.get("kind", "text"),
+        window_context.context_for_model(ctx), bool(ctx.get("has_selection")),
+        audio_pcm=pcm, title=ctx.get("title"))
+
+    if not result["ok"]:
+        _window_action("error", app, result["reason"])
+        log_info(f"Speak-to-window: {result['reason']}")
+        return
+
+    # The AX element captured when the key went down is the one to write to.
+    # Re-reading focus here would find Ultron's own window if the user clicked away.
+    ok, how = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: text_injector.inject_text(
+            result["text"], element=ctx.get("element"), pid=ctx.get("pid"),
+            replacing_selection=bool(ctx.get("has_selection"))))
+
+    if ok:
+        _window_action("complete", app, result["text"][:80])
+        log_info(f"Speak-to-window wrote {len(result['text'])} chars into {app} ({how}).")
+    else:
+        _window_action("error", app, how)
+        log_info(f"Speak-to-window could not write into {app}: {how}")
+
+
+def start_window_hotkey():
+    global window_hotkey
+    if not window_context.is_trusted():
+        log_info("Speak-to-window disabled: grant Accessibility access in System Settings.")
+        return
+    window_hotkey = hotkey_manager.HotkeyManager(start_window_voice, stop_window_voice)
+    if window_hotkey.start():
+        log_info(f"Speak-to-window armed — hold {hotkey_manager.HOTKEY_LABEL} in any app.")
+    else:
+        log_info(f"Speak-to-window unavailable: {window_hotkey.failure}")
+        window_hotkey = None
 
 # ---------- Lifecycle control ----------
 # run_ultron() runs on its own loop, usually inside a thread owned by a GUI
@@ -357,6 +467,10 @@ async def ws_handler(websocket):
                     pcm_b64 = data.get("pcm_base64")
                     if pcm_b64:
                         pcm_bytes = base64.b64decode(pcm_b64)
+                        # Push-to-talk owns the mic while held: this speech is an
+                        # instruction for another app, not for Live to answer.
+                        if window_voice_capture(pcm_bytes, "gui"):
+                            continue
                         mic_audio_buffer.extend(pcm_bytes)
                         if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
                             mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
@@ -538,6 +652,8 @@ async def send_audio_task(session, input_stream, session_disconnect_event):
                 lambda: input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
             )
             if data:
+                if window_voice_capture(data, "pyaudio"):
+                    continue
                 mic_audio_buffer.extend(data)
                 if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
                     mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
@@ -1971,6 +2087,7 @@ async def run_ultron():
     telemetry_worker = asyncio.create_task(telemetry_task())
     watcher_task = asyncio.create_task(shutdown_watcher())
     agent_results_task = asyncio.create_task(agent_result_dispatcher())
+    start_window_hotkey()
 
     # Load local persistent memory
     memory = load_memory()
@@ -2061,6 +2178,9 @@ async def run_ultron():
             task.cancel()
         await asyncio.gather(playback_task, telemetry_worker, watcher_task, agent_results_task,
                              return_exceptions=True)
+
+        if window_hotkey:
+            window_hotkey.stop()
 
         # 2. Stop accepting clients.
         ws_server.close()

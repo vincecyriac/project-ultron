@@ -15,6 +15,7 @@
 - 🔮 **Ambient Holographic Orb** — A Three.js plasma core that *is* the status display. Colour is bound to state and holds steady until the state changes; motion reacts to what you actually hear.
 - 🧩 **Async Widget Deck** — Asking for data mounts a shimmering skeleton card *instantly*; a background generator writes the finished HTML — hero figures, inline SVG charts, metric matrices — and it hydrates in place a few seconds later. The voice never waits on layout.
 - 🤖 **Tiered Background Agents** — Live stays responsive for barge-in and dispatches multi-step work to specialised models: **Gemini 3.1 Pro** for macOS automation, **Gemini 3.7 Flash** for spatial scene generation.
+- ⌨️ **Speak-to-Window** — Hold `⌘⇧Space` in *any* app and talk. Ultron reads the focused text field over the Accessibility API, rewrites or drafts against what is already there, and types the result back natively. Your voice never reaches the Live conversation; nothing is spoken aloud.
 - 🌐 **Spatial Visualization Engine (SVE)** — Live, persistent, interactive 3D scene graphs in Three.js with object-level delta updates and local MediaPipe hand-gesture control.
 - 🖥️ **Multi-Monitor Vision & OS Automation** — Quartz display enumeration, context-aware capture, and hardware-level `CGEvent` mouse/keyboard injection across every display.
 - 👤 **Biometric Identity** — Local ONNX face recognition (YuNet + SFace) and MFCC voice profiling, entirely on-device.
@@ -80,6 +81,7 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 - **Camera PIP** (bottom-left) — mirrored; the hand-landmark overlay is mirrored with it so the skeleton stays registered.
 - **Command lane** (bottom-centre) — ghosted until you hover, focus, or simply start typing.
 - **Sensor dock** (bottom-right) — three icon toggles: mic, camera, screen. Active glows cyan; inactive is ghosted with a strike.
+- **Speak-to-Window pill** (top-centre) — appears only while `⌘⇧Space` is doing something: a cyan pulse while it listens, an amber shimmer while it writes, one green flash on insertion. It adds no persistent chrome and removes itself when done.
 
 ---
 
@@ -91,6 +93,7 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
                         │  • Web GUI (Orb / Widget Deck / Spatial 3D / Gestures)  │
                         │  • PyWebView desktop shell  • Phone via Tailscale HTTPS │
                         │  • Voice In / Out (16 kHz PCM Mic / 24 kHz Speaker)     │
+                        │  • ⌘⇧Space push-to-talk, in any app (Speak-to-Window)   │
                         └───────────────▲─────────────────────────▲───────────────┘
                                         │ (WebSocket / Audio)     │ (Touch / Video)
                                         ▼                         ▼
@@ -116,6 +119,12 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 │ • sentry_personal│ │ • widget writer  │ │ • web_gui/gestures.js│ │   Persistent facts   │
 │ • sentry_web     │ │   Gemini 3.7 Fl. │ │   MediaPipe hands    │ │                      │
 └──────────────────┘ └──────────────────┘ └──────────────────────┘ └──────────────────────┘
+
+   ┌───────────────────────────────────────────────────────────────────────────────┐
+   │  SPEAK-TO-WINDOW  —  bypasses the Live session entirely while the key is held  │
+   │  hotkey_manager (CGEventTap)  →  window_context (AX read)  →  mic diverted     │
+   │  →  speak_to_window_agent (Gemini 3.1 Flash-Lite)  →  text_injector (AX / ⌘V)  │
+   └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -179,21 +188,36 @@ Measured end to end: the tool returns at **+0.00s**, the skeleton is on screen i
 - **Window & Spaces enumeration** (`list_open_windows`) across the Quartz Window Server.
 - **Shell and AppleScript execution** with timeouts and the remote approval gate.
 
-### 6. Biometric Face & Voice Recognition (`sentry_recognition.py`)
+### 6. Speak-to-Window Voice Injection (`hotkey_manager.py`, `window_context.py`, `speak_to_window_agent.py`, `text_injector.py`)
+Dictation that understands the document it is landing in.
+
+**How a press flows**
+1. **`hotkey_manager.py`** — a Quartz `CGEventTap` watches for `⌘⇧Space` system-wide and swallows the chord so no space is typed. The tap owns a `CFRunLoop` on its own thread, because the hub runs in a daemon thread and never holds the main run loop. Auto-repeat is ignored, and a modifier released early still ends the capture.
+2. **`window_context.py`** — on key-down, the frontmost app is resolved via `NSWorkspace` and its focused AX element read for `AXSelectedText`, `AXValue`, role and title. Each app is classified as `terminal`, `code`, `message` or `text`. A selection wins as the context; otherwise the buffer's last 4 000 characters are used, since the cursor is what matters, not the file's history.
+3. **Mic diversion** — while the key is held, PCM is routed into a private buffer instead of the Live socket, from exactly one source. Live neither hears the instruction nor answers it.
+4. **`speak_to_window_agent.py`** — on key-up, the raw audio and the window context go to **`gemini-3.1-flash-lite`** in a *single* call. Transcribing and then transforming would double the latency of a key the user is holding, and would discard the context that disambiguates the instruction. Output is pure text with no preamble, styled per app class: terminals get a bare command, editors get source matching the surrounding indentation, mail and chat match the thread's register.
+5. **`text_injector.py`** — a selection is replaced through `AXSelectedText`; everything else goes through a clipboard swap and a synthetic `⌘V`, then the previous clipboard is restored. The AX element captured at key-down is the write target, because focus has usually moved by the time the reply lands.
+
+**Design notes**
+- **Indentation is restored deterministically, not by prompting.** Every model tested rewrites a selected block flush-left, which drops a `def` into column 0 inside a class body. The selection's leading whitespace is measured and re-applied to the whole replacement.
+- **There is no AX path for the no-selection case.** Writing `AXValue` means read-append-write, which appends at the *end* of the buffer rather than at the caret — and in Electron apps it bakes a field's placeholder string into its real value. Paste respects the cursor.
+- A tap shorter than 350 ms, or under ~0.5 s of audio, is discarded as an accident.
+
+### 7. Biometric Face & Voice Recognition (`sentry_recognition.py`)
 - OpenCV **YuNet** ONNX detection + **SFace** 128-d embeddings, cosine-matched against `ultron_profiles.json`.
 - **Voice fingerprinting** — pure-NumPy MFCCs pooled by mean and variance from the rolling mic buffer.
 
-### 7. Spatial Visualization Engine (`sentry_scene.py`, `web_gui/sve.js`, `web_gui/gestures.js`)
+### 8. Spatial Visualization Engine (`sentry_scene.py`, `web_gui/sve.js`, `web_gui/gestures.js`)
 - **Persistent 3D workspace** — scenes live in `ultron_scenes.json` and stay on stage until dismissed.
 - **Incremental delta protocol** — update, rotate, recolour, highlight, hide, or explode individual objects; never a full rebuild.
 - **Screen-sized labels** — annotations are sized to a constant on-screen height, depth-tested so geometry occludes them, and decluttered by screen-space overlap (12 visible at once, nearest first).
 - **Markerless hand tracking** — vendored MediaPipe HandLandmarker WASM: point to hover, pinch to grab, pinch empty space to orbit, two-hand pinch to zoom.
 
-### 8. Personal Productivity Suite (`sentry_personal.py`)
+### 9. Personal Productivity Suite (`sentry_personal.py`)
 - **EventKit calendars** via PyObjC across iCloud, Google, and Exchange.
 - **Apple Mail** via AppleScript — read recent mail, search sender/subject.
 
-### 9. Zero-Trust Remote Access (`setup_remote.sh`, Tailscale)
+### 10. Zero-Trust Remote Access (`setup_remote.sh`, Tailscale)
 - The hub binds only to `127.0.0.1`; remote access is tunnelled through Tailscale Serve HTTPS.
 - **Human-in-the-loop approvals** — while a remote client is connected, every shell and AppleScript call suspends for one-tap approval with a 45-second auto-deny.
 - **Smart sensor routing** — the phone's mic and camera become the primary senses; the unattended Mac's webcam and screen are left alone unless asked for explicitly.
@@ -236,7 +260,7 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 ## 💻 Tech Stack
 
 - **Core Runtime** — Python 3.10+ (asyncio, websockets, PyAudio, aiohttp, psutil)
-- **AI Models** — Google Gemini via `google-genai`: Live `3.1-flash-live-preview`, agents and widget generator `3.1-pro-preview` / `3.7-flash`
+- **AI Models** — Google Gemini via `google-genai`: Live `3.1-flash-live-preview`, agents and widget generator `3.1-pro-preview` / `3.7-flash`, Speak-to-Window `3.1-flash-lite` (chosen for latency: a held key cannot wait on a thinking model)
 - **macOS Native APIs** — PyObjC (Quartz CoreGraphics, EventKit, Foundation, WebKit), AppleScript
 - **Computer Vision & Biometrics** — OpenCV, ONNX (YuNet, SFace), NumPy, Pillow
 - **Frontend** — Vanilla JS + CSS, custom GLSL shaders, Three.js, MediaPipe HandLandmarker (WASM)
@@ -255,7 +279,7 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 
 ### 2. Permissions
 Grant these in **System Settings → Privacy & Security**:
-- **Accessibility** — `CGEvent` mouse/keyboard automation and UI tree reads
+- **Accessibility** — `CGEvent` mouse/keyboard automation, UI tree reads, and the global `⌘⇧Space` push-to-talk tap (Speak-to-Window is disabled without it)
 - **Screen Recording** — Quartz display capture
 - **Microphone & Camera** — voice streaming and visual perception
 - **Calendars & Automation** — EventKit and AppleScript/Mail control
@@ -306,6 +330,20 @@ The WebSocket gateway runs alongside it on `ws://127.0.0.1:8765`.
 
 Ctrl+C, closing the window, or saying "goodbye" all shut down gracefully — audio devices, sockets and servers are released in order.
 
+**Using Speak-to-Window.** Ultron only has to be running — it does not need to be focused, or even visible.
+
+1. Click into any text field, in any app. Select something first if you want it rewritten.
+2. Hold **`⌘⇧Space`** and say what you want.
+3. Release. The text is typed in a couple of seconds.
+
+| You are in | You say | You get |
+| --- | --- | --- |
+| Terminal | "find every python file changed in the last two days" | `find . -name "*.py" -mtime -2` |
+| VS Code, with a function selected | "add a try except that returns an empty dict if the file is missing" | The function rewritten, at its original indentation |
+| Mail, reading a thread | "reply saying Thursday works and I'll bring the mockups" | A reply in the thread's own register |
+
+The instruction is never sent to the Live conversation and nothing is spoken back. If Accessibility permission is missing the feature is skipped with a log line, and the rest of Ultron runs normally.
+
 ---
 
 ## 📱 Remote Access (Phone / Tablet)
@@ -335,6 +373,10 @@ project_ultron/
 ├── ultron_agents.py           # Background agent tiers (os / spatial) and their tool loop
 ├── widget_generator_agent.py  # Card HTML synthesis + output sanitiser
 ├── app_desktop.py             # PyWebView desktop shell + process lifecycle
+├── hotkey_manager.py          # Global ⌘⇧Space push-to-talk tap (Quartz CGEventTap)
+├── window_context.py          # Focused-window AX reader: selection, buffer, app class
+├── speak_to_window_agent.py   # Audio + window context -> injectable text, one call
+├── text_injector.py           # AX selection replace, clipboard+⌘V fallback
 ├── sentry_vision.py           # Quartz multi-monitor capture & coordinate tracking
 ├── sentry_action.py           # CGEvent mouse/keyboard automation & click mapping
 ├── sentry_exec.py             # Shell & osascript execution

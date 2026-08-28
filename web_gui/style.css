@@ -1425,3 +1425,125 @@ body.widgets-active .workspace {
 @media (prefers-reduced-motion: reduce) {
   .orb-stage, .workspace, .caption-lane, .command-lane, .caption { transition-duration: 0.01ms; }
 }
+
+/* ---------- Speak-to-Window transient HUD ----------
+   Push-to-talk fires while the user is focused on another application, so this
+   pill is deliberately not part of the persistent layout: it slides in from the
+   top edge above everything, then removes itself. */
+
+.window-pill {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px 9px 13px;
+  max-width: min(460px, 60vw);
+  border-radius: 999px;
+  background: rgba(10, 15, 24, 0.82);
+  border: 1px solid rgba(0, 242, 254, 0.22);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, -18px);
+  transition: opacity 0.28s var(--ease-spatial), transform 0.28s var(--ease-spatial),
+              border-color 0.28s ease;
+}
+
+.window-pill.visible {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* The pill occupies the top-centre band, which is exactly where the first
+   widget card sits once the deck is populated. Rather than float over it, the
+   deck yields for as long as the pill is up. With no widgets the workspace is
+   transparent, so nothing moves. */
+body.widgets-active.window-pill-open .workspace {
+  top: calc(var(--gutter) + 46px);
+  transition: top 0.28s var(--ease-spatial);
+}
+
+.window-pill-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.window-pill-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan);
+}
+
+/* Listening: a steady pulse, so a held key is unmistakably live. */
+.window-pill.recording { border-color: rgba(0, 242, 254, 0.45); color: var(--cyan); }
+.window-pill.recording .window-pill-dot { animation: windowPulse 1s ease-in-out infinite; }
+
+@keyframes windowPulse {
+  0%, 100% { transform: scale(1);   opacity: 1;   }
+  50%      { transform: scale(1.5); opacity: 0.45; }
+}
+
+/* Inferring: the sweep runs across the whole pill, not just the dot. */
+.window-pill.processing { border-color: rgba(255, 184, 0, 0.42); color: var(--amber, #FFB800); }
+.window-pill.processing .window-pill-dot {
+  background: #FFB800;
+  box-shadow: 0 0 10px #FFB800;
+  animation: windowPulse 0.7s ease-in-out infinite;
+}
+.window-pill.processing::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 184, 0, 0.16) 50%, transparent 80%);
+  background-size: 220% 100%;
+  animation: windowShimmer 1.25s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes windowShimmer {
+  from { background-position: 120% 0; }
+  to   { background-position: -120% 0; }
+}
+
+/* Written: one green flash, then it leaves. */
+.window-pill.complete {
+  border-color: rgba(0, 255, 136, 0.5);
+  color: #00FF88;
+  animation: windowFlash 0.5s ease-out;
+}
+.window-pill.complete .window-pill-dot {
+  background: #00FF88;
+  box-shadow: 0 0 14px #00FF88;
+}
+
+@keyframes windowFlash {
+  0%   { box-shadow: 0 10px 34px rgba(0,0,0,0.55), 0 0 0 0 rgba(0, 255, 136, 0.5); }
+  100% { box-shadow: 0 10px 34px rgba(0,0,0,0.55), 0 0 0 16px rgba(0, 255, 136, 0); }
+}
+
+.window-pill.error { border-color: rgba(229, 114, 111, 0.5); color: #E5726F; }
+.window-pill.error .window-pill-dot {
+  background: #E5726F;
+  box-shadow: 0 0 10px #E5726F;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .window-pill,
+  .window-pill-dot,
+  .window-pill::after { animation: none !important; transition: opacity 0.2s ease; }
+}

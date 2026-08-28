@@ -302,8 +302,53 @@ function initWebSocket() {
   };
 }
 
+// ---------- Speak-to-Window transient HUD ----------
+// Mirrors the hub's push-to-talk state machine: recording -> processing ->
+// complete | error. Each state carries its own dwell time, so a success flashes
+// briefly while a failure stays long enough to read.
+
+const windowPillEl = document.getElementById("window-pill");
+const windowPillTextEl = document.getElementById("window-pill-text");
+const WINDOW_PILL_DWELL = { complete: 1800, error: 3600, idle: 0 };
+let windowPillTimer = null;
+
+function showWindowPill(state, app, detail) {
+  if (!windowPillEl) return;
+  clearTimeout(windowPillTimer);
+
+  if (state === "idle") {
+    windowPillEl.classList.remove("visible");
+    document.body.classList.remove("window-pill-open");
+    return;
+  }
+
+  const target = app || "the focused app";
+  const label = {
+    recording: `Listening → ${target}`,
+    processing: `Writing for ${target}`,
+    complete: detail ? `Inserted → ${detail}` : `Inserted into ${target}`,
+    error: detail || `Could not write into ${target}`,
+  }[state] || target;
+
+  windowPillTextEl.textContent = label;
+  windowPillEl.className = `window-pill visible ${state}`;
+  document.body.classList.add("window-pill-open");
+
+  const dwell = WINDOW_PILL_DWELL[state];
+  if (dwell) {
+    windowPillTimer = setTimeout(() => {
+      windowPillEl.classList.remove("visible");
+      document.body.classList.remove("window-pill-open");
+    }, dwell);
+  }
+}
+
 function handleServerMessage(msg) {
   switch (msg.type) {
+    case "window_action":
+      showWindowPill(msg.state, msg.app, msg.detail);
+      break;
+
     case "status":
       updateStatus(msg.status);
       break;
