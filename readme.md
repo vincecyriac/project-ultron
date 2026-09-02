@@ -15,6 +15,7 @@
 - 🔮 **Ambient Holographic Orb** — A Three.js plasma core that *is* the status display. Colour is bound to state and holds steady until the state changes; motion reacts to what you actually hear.
 - 🧩 **Async Widget Deck** — Asking for data mounts a shimmering skeleton card *instantly*; a background generator writes the finished HTML — hero figures, inline SVG charts, metric matrices — and it hydrates in place a few seconds later. The voice never waits on layout.
 - 🤖 **Tiered Background Agents** — Live stays responsive for barge-in and dispatches multi-step work to specialised models: **Gemini 3.1 Pro** for macOS automation, **Gemini 3.7 Flash** for spatial scene generation.
+- 🚪 **Return-to-Desk Briefing** — Ultron notices when you come back after a spell away and puts an intelligence briefing on screen before you ask: the time, live system gauges, today's agenda, and market movement. The greeting spoken aloud stays under ten words; everything else is on the card.
 - 🌐 **Spatial Visualization Engine (SVE)** — Live, persistent, interactive 3D scene graphs in Three.js with object-level delta updates and local MediaPipe hand-gesture control.
 - 🖥️ **Multi-Monitor Vision & OS Automation** — Quartz display enumeration, context-aware capture, and hardware-level `CGEvent` mouse/keyboard injection across every display.
 - 👤 **Biometric Identity** — Local ONNX face recognition (YuNet + SFace) and MFCC voice profiling, entirely on-device.
@@ -116,6 +117,12 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 │ • sentry_personal│ │ • widget writer  │ │ • web_gui/gestures.js│ │   Persistent facts   │
 │ • sentry_web     │ │   Gemini 3.7 Fl. │ │   MediaPipe hands    │ │                      │
 └──────────────────┘ └──────────────────┘ └──────────────────────┘ └──────────────────────┘
+
+   ┌───────────────────────────────────────────────────────────────────────────────┐
+   │  PRESENCE  —  HID idle timer (free) → away/return state machine → 4h cooldown  │
+   │  presence_detector.py  →  briefing_agent.py (clock, health, agenda)            │
+   │  →  create_skeleton_widget()  →  widget generator  →  card + ≤10-word greeting │
+   └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -179,21 +186,38 @@ Measured end to end: the tool returns at **+0.00s**, the skeleton is on screen i
 - **Window & Spaces enumeration** (`list_open_windows`) across the Quartz Window Server.
 - **Shell and AppleScript execution** with timeouts and the remote approval gate.
 
-### 6. Biometric Face & Voice Recognition (`sentry_recognition.py`)
+### 6. Presence Detection & Daily Briefing (`presence_detector.py`, `briefing_agent.py`)
+Ambient awareness that costs almost nothing until it matters.
+
+**Tier 1 — the idle timer.** `CGEventSourceSecondsSinceLastEventType` reports how long it has been since any keyboard, mouse or trackpad event. The window server is already counting, so polling it every 5 s is free — no camera, no inference, no GPU. Fifteen minutes of silence marks you **away**; input inside the last 5 s marks you **back**.
+
+**Tier 2 — optional face confirmation.** `VERIFY_WITH_CAMERA` (off by default) additionally checks that a face is visible before briefing, reusing the YuNet detector. It is opt-in on purpose: Tier 1 already proves a human is at the keyboard, and opening the lens unannounced to confirm *which* human is a privacy decision, not a technical one. It fails **open** — a camera busy on a call must never silently suppress your briefing.
+
+**Guards that stop it being annoying**
+- A **4-hour cooldown**, so stepping out twice before lunch does not brief you twice.
+- A brief pause is not an absence — under the 15-minute threshold, nothing fires.
+- **Launching while already idle is not a return.** Without this, opening the app would brief whoever happened to be standing there.
+- A failing generator never kills the loop.
+
+**The card** (`briefing_agent.py`) gathers only what it can read locally — clock, greeting phase, CPU/RAM/disk/battery, and today's EventKit agenda — then hands that to the existing skeleton-and-hydrate pipeline, so the briefing is sanitised and mounted by the same code path as every other card. Markets and weather are named in the prompt for the generator's search grounding to fetch.
+
+**Nothing is invented.** An early build filled empty space with a fabricated hostname, uptime and "SECURITY: NOMINAL". The context now forbids identifiers, uptimes and status words outright, and a column with no real data is *dropped* rather than padded — the layout is flex, so two columns fill the card as cleanly as three. If the calendar is unreadable or no location is set, the card says so instead of guessing.
+
+### 7. Biometric Face & Voice Recognition (`sentry_recognition.py`)
 - OpenCV **YuNet** ONNX detection + **SFace** 128-d embeddings, cosine-matched against `ultron_profiles.json`.
 - **Voice fingerprinting** — pure-NumPy MFCCs pooled by mean and variance from the rolling mic buffer.
 
-### 7. Spatial Visualization Engine (`sentry_scene.py`, `web_gui/sve.js`, `web_gui/gestures.js`)
+### 8. Spatial Visualization Engine (`sentry_scene.py`, `web_gui/sve.js`, `web_gui/gestures.js`)
 - **Persistent 3D workspace** — scenes live in `ultron_scenes.json` and stay on stage until dismissed.
 - **Incremental delta protocol** — update, rotate, recolour, highlight, hide, or explode individual objects; never a full rebuild.
 - **Screen-sized labels** — annotations are sized to a constant on-screen height, depth-tested so geometry occludes them, and decluttered by screen-space overlap (12 visible at once, nearest first).
 - **Markerless hand tracking** — vendored MediaPipe HandLandmarker WASM: point to hover, pinch to grab, pinch empty space to orbit, two-hand pinch to zoom.
 
-### 8. Personal Productivity Suite (`sentry_personal.py`)
+### 9. Personal Productivity Suite (`sentry_personal.py`)
 - **EventKit calendars** via PyObjC across iCloud, Google, and Exchange.
 - **Apple Mail** via AppleScript — read recent mail, search sender/subject.
 
-### 9. Zero-Trust Remote Access (`setup_remote.sh`, Tailscale)
+### 10. Zero-Trust Remote Access (`setup_remote.sh`, Tailscale)
 - The hub binds only to `127.0.0.1`; remote access is tunnelled through Tailscale Serve HTTPS.
 - **Human-in-the-loop approvals** — while a remote client is connected, every shell and AppleScript call suspends for one-tap approval with a 45-second auto-deny.
 - **Smart sensor routing** — the phone's mic and camera become the primary senses; the unattended Mac's webcam and screen are left alone unless asked for explicitly.
@@ -213,6 +237,11 @@ The generator is given this vocabulary and nothing else — no `<style>` blocks,
 | `.hud-svg-chart` | Wrapper for an inline `<svg viewBox="0 0 400 120">` — gradient area fill, glowing stroke, dashed reference line |
 | `.hud-bar` | Linear meter |
 | `.hud-note` | Closing one- or two-line summary |
+| `.hud-briefing` + `.hud-briefing-col` | Flexible briefing columns; a column with no real data is dropped and the rest widen to fill |
+| `.hud-briefing-when` / `.hud-briefing-time` | Uppercase date line and the large clock figure |
+| `.hud-ring` + `.hud-ring-label` / `.hud-ring-caption` | Radial gauge; the percentage is set inline as `style="--pct:62"` |
+| `.hud-timeline` + `.hud-timeline-row` | Agenda feed — time rail, title, and a meta line |
+| `.hud-pulse` + `.hud-pulse-move up\|down\|flat` | Market rows with a signed, colour-coded move |
 
 Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs and images inside `.hud` are given baseline styling rather than inheriting browser defaults.
 
@@ -285,6 +314,10 @@ GEMINI_MODEL=gemini-3.1-flash-live-preview
 
 # Assistant voice: Charon (default), Kore, Puck
 ULTRON_VOICE=Charon
+
+# Optional. Where you are, for the briefing card's weather block.
+# Leave unset and the weather section is omitted rather than guessed.
+ULTRON_LOCATION=Kochi, India
 ```
 
 ### 5. Running Ultron
@@ -335,6 +368,8 @@ project_ultron/
 ├── ultron_agents.py           # Background agent tiers (os / spatial) and their tool loop
 ├── widget_generator_agent.py  # Card HTML synthesis + output sanitiser
 ├── app_desktop.py             # PyWebView desktop shell + process lifecycle
+├── presence_detector.py       # HID idle-timer presence state machine (+ optional face check)
+├── briefing_agent.py          # Return-to-desk briefing context: clock, health, agenda
 ├── sentry_vision.py           # Quartz multi-monitor capture & coordinate tracking
 ├── sentry_action.py           # CGEvent mouse/keyboard automation & click mapping
 ├── sentry_exec.py             # Shell & osascript execution

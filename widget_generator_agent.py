@@ -42,6 +42,24 @@ USE THESE CLASSES — they are already styled; do not invent your own colours or
   .hud-note           a closing one or two line summary
   .hud-bar            <div class="hud-bar"><span style="width:64%"></span></div> for a meter
 
+BRIEFING LAYOUT — use these only for a return-to-desk / daily briefing card:
+  .hud-briefing       a 3-column grid; put exactly three .hud-briefing-col children inside
+  .hud-briefing-col   one column. Left = time and system, centre = schedule, right = markets/weather
+  .hud-briefing-when  small uppercase date line, e.g. FRIDAY 28 AUGUST
+  .hud-briefing-time  the large clock figure, e.g. 5:54 PM
+  .hud-ring           radial load gauge. Set the percentage inline:
+                      <div class="hud-ring" style="--pct:62"><span class="hud-ring-label">62%</span></div>
+                      followed by <div class="hud-ring-caption">CPU</div>
+  .hud-timeline       wrapper for the agenda
+  .hud-timeline-row   one event: <span class="hud-timeline-time">09:30</span>
+                      <div><div class="hud-timeline-title">Architecture review</div>
+                      <div class="hud-timeline-meta">45 min · Zoom</div></div>
+  .hud-pulse          one market row: <span class="hud-pulse-name">S&amp;P 500</span>
+                      <span class="hud-pulse-move up">+0.42%</span>
+                      the move span takes up, down or flat
+  A briefing column with no real data must be dropped, not padded. Never invent
+  host names, uptimes, serials, versions or security statuses to fill space.
+
 CHARTS — ONLY WHEN THE DATA EARNS ONE
 Most cards do not need a chart. Draw one ONLY when you genuinely hold either
 a series of values over time (a price through the day, a week of readings) or

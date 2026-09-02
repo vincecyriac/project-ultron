@@ -1425,3 +1425,190 @@ body.widgets-active .workspace {
 @media (prefers-reduced-motion: reduce) {
   .orb-stage, .workspace, .caption-lane, .command-lane, .caption { transition-duration: 0.01ms; }
 }
+
+/* ---------- Briefing card: three-column HUD ----------
+   Used by the return-to-desk card. The columns collapse in order — the agenda
+   is the reason the card exists, so it is the last thing to lose its own row. */
+
+/* Flex rather than a fixed 3-track grid: when a column is dropped for want of
+   real data — no agenda, no weather — a grid leaves its track behind as dead
+   space, while flex lets the surviving columns take the full width. */
+.hud-briefing {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: flex-start;
+}
+
+.hud-briefing-col {
+  flex: 1 1 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* The agenda is the widest content, but only when it is actually the middle of
+   three — as the last of two it should not hog the card. */
+.hud-briefing-col:nth-child(2):not(:last-child) { flex: 1.5 1 260px; }
+
+/* A column is far narrower than a full card, so the shared 3-up metric grid
+   squeezes its values until they ellipsise ("13.1 / 1…"). Stack them instead. */
+.hud-briefing-col .hud-metric-grid {
+  grid-template-columns: 1fr;
+  gap: 6px 0;
+}
+
+/* Keep the label above the value here: side-by-side leaves the value ~120px
+   in a 276px column, which truncates real readings like "81 GB free / 460 GB".
+   Wrapping is preferable to an ellipsis — a briefing must not hide a figure. */
+.hud-briefing-col .hud-metric .v {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+/* The caption belongs under the ring, not under the whole column. */
+.hud-briefing-col .hud-ring { margin: 2px 0 0; }
+.hud-briefing-col .hud-ring-caption { width: 76px; margin-top: 2px; }
+
+.hud-briefing-col + .hud-briefing-col {
+  padding-left: 18px;
+  border-left: 1px solid rgba(0, 242, 254, 0.12);
+}
+
+.hud-briefing-when {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+
+.hud-briefing-time {
+  font-size: 30px;
+  font-weight: 300;
+  line-height: 1;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Radial system-load ring. --pct is set inline by the generator (0-100). */
+.hud-ring {
+  --pct: 0;
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background:
+    conic-gradient(var(--cyan) calc(var(--pct) * 1%), rgba(255, 255, 255, 0.07) 0);
+  position: relative;
+}
+
+.hud-ring::after {
+  content: "";
+  position: absolute;
+  inset: 7px;
+  border-radius: 50%;
+  background: rgba(10, 15, 24, 0.92);
+}
+
+.hud-ring-label {
+  position: relative;
+  z-index: 1;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-ring-caption {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+/* Agenda timeline: a rail with a node per event. */
+.hud-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: relative;
+}
+
+.hud-timeline-row {
+  display: grid;
+  grid-template-columns: 62px 1fr;
+  gap: 10px;
+  padding: 7px 0 7px 0;
+  align-items: baseline;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.hud-timeline-row:last-child { border-bottom: none; }
+
+.hud-timeline-time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--cyan);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.hud-timeline-title {
+  font-size: 12.5px;
+  color: var(--text);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.hud-timeline-meta {
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+/* Market pulse pills. */
+.hud-pulse {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.hud-pulse-name {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.hud-pulse-move {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-pulse-move.up { color: #00FF88; }
+.hud-pulse-move.down { color: #E5726F; }
+.hud-pulse-move.flat { color: var(--text-dim); }
+
+/* Once the columns wrap, a left divider points at nothing — move it on top. */
+@media (max-width: 620px) {
+  .hud-briefing-col { flex: 1 1 100%; }
+  .hud-briefing-col + .hud-briefing-col {
+    padding-left: 0;
+    padding-top: 14px;
+    border-left: none;
+    border-top: 1px solid rgba(0, 242, 254, 0.12);
+  }
+}

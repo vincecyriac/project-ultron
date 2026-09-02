@@ -38,6 +38,8 @@ import sentry_personal
 import sentry_scene
 import ultron_agents
 import widget_generator_agent
+import presence_detector
+import briefing_agent
 
 # Load environment variables
 load_dotenv()
@@ -953,6 +955,58 @@ async def agent_result_dispatcher():
             )
         except Exception as e:
             log_info(f"Could not deliver agent result to the live session: {e}")
+
+# ---------- Autonomous return-to-desk briefing ----------
+#
+# A briefing is mounted through the ordinary skeleton pipeline rather than by
+# broadcasting widget payloads directly: that path already sanitises the
+# generated HTML, enforces the deck limit, and patches the card in place.
+#
+# The spoken welcome is queued the same way finished agent work is, so it waits
+# for a gap. Sending it immediately would start a new Live turn and cut off
+# whatever Ultron happened to be saying.
+
+briefing_state = {"running": False, "last_at": 0.0}
+
+
+async def trigger_autonomous_briefing(reason: str = "return"):
+    """Mount the briefing card and greet Vince once it is on screen."""
+    if briefing_state["running"]:
+        log_info("Briefing already in flight; skipping.")
+        return
+    briefing_state["running"] = True
+    try:
+        context = await briefing_agent.build_briefing_context()
+        title = briefing_agent.briefing_title()
+
+        # Replace any previous briefing rather than stacking a second one.
+        if briefing_agent.BRIEFING_WIDGET_ID in active_widgets:
+            dismiss_widget(briefing_agent.BRIEFING_WIDGET_ID)
+
+        outcome = create_skeleton_widget(briefing_agent.BRIEFING_WIDGET_ID, title, context)
+        if not outcome.startswith("Card is on screen"):
+            log_info(f"Briefing card was refused: {outcome}")
+            return
+
+        briefing_state["last_at"] = time.time()
+        await deliver_agent_result("briefing", briefing_agent.spoken_welcome())
+        log_info(f"Autonomous briefing mounted ({reason}).")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log_info(f"Briefing failed: {e}")
+    finally:
+        briefing_state["running"] = False
+
+
+async def presence_task():
+    """Watch for Vince returning to the desk."""
+    monitor = presence_detector.PresenceMonitor(
+        on_return=trigger_autonomous_briefing,
+        webcam_factory=sentry_vision.PersistentWebcam,
+        log=log_info)
+    await monitor.run(shutdown_event)
+
 
 
 def _parse_tool_json(raw, default):
@@ -1971,6 +2025,7 @@ async def run_ultron():
     telemetry_worker = asyncio.create_task(telemetry_task())
     watcher_task = asyncio.create_task(shutdown_watcher())
     agent_results_task = asyncio.create_task(agent_result_dispatcher())
+    presence_watch_task = asyncio.create_task(presence_task())
 
     # Load local persistent memory
     memory = load_memory()
@@ -2057,9 +2112,11 @@ async def run_ultron():
         # 1. Stop everything that could still touch an audio device, and WAIT
         #    for it — cancelling without awaiting used to race PyAudio teardown
         #    against an in-flight output_stream.write().
-        for task in (playback_task, telemetry_worker, watcher_task, agent_results_task):
+        for task in (playback_task, telemetry_worker, watcher_task, agent_results_task,
+                     presence_watch_task):
             task.cancel()
         await asyncio.gather(playback_task, telemetry_worker, watcher_task, agent_results_task,
+                             presence_watch_task,
                              return_exceptions=True)
 
         # 2. Stop accepting clients.
