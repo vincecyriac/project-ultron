@@ -1,6 +1,6 @@
 # Spatial Visualization Engine (SVE)
 
-Ultron's visualization system. Replaces the former HTML-page generator with
+FRIDAY's visualization system. Replaces the former HTML-page generator with
 live, persistent, interactive 3D scenes rendered inside the GUI's **Spatial**
 tab. Scenes behave like digital objects in a workspace: they stay active after
 creation, can be edited conversationally at object level, and are manipulated
@@ -19,13 +19,13 @@ create_3d_scene / update_3d_scene / delete_3d_scene / list_3d_scenes / inspect_3
         │  JSON scene-graph specs & ops
         ▼
 sentry_scene.SceneManager                 ← validation, persistence
-        │                                    (ultron_scenes.json), state, diffing
+        │                                    (friday_scenes.json), state, diffing
         │  incremental op broadcast (WebSocket)
         ▼
 web_gui/sve.js                            ← rendering backend (Three.js)
         │                                    object cache, animation loop,
         ▼                                    interaction manager
-Spatial tab in Ultron GUI                 ← live scene; user actions stream
+Spatial tab in FRIDAY GUI                 ← live scene; user actions stream
                                              back to SceneManager
 ```
 
@@ -60,7 +60,7 @@ Edit ops (`update_3d_scene`): `add`, `update` (merge `changes`), `remove`,
 
 ## Persistence & memory
 
-- Scenes persist in `ultron_scenes.json`; reload on restart, pushed to every
+- Scenes persist in `friday_scenes.json`; reload on restart, pushed to every
   connecting GUI as an `sve_workspace` snapshot.
 - The AI recalls stage state via `list_3d_scenes` / `inspect_3d_scene` —
   including which object the **user selected by clicking**, so "make it red"
@@ -79,7 +79,7 @@ Built-in sources (`web_gui/sve.js`):
 
 MediaPipe HandLandmarker, fully local (vendored wasm + model, ~27MB in
 `web_gui/vendor/`). Toggle with the **✋ Hands** button in the Spatial toolbar;
-shares the webcam stream with the preview card (refcounted `UltronCamera`).
+shares the webcam stream with the preview card (refcounted `FridayCamera`).
 
 | Gesture | Action |
 |---|---|

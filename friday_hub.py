@@ -36,7 +36,7 @@ import sentry_recognition
 import sentry_web
 import sentry_personal
 import sentry_scene
-import ultron_agents
+import friday_agents
 import widget_generator_agent
 
 # Load environment variables
@@ -49,14 +49,34 @@ except AttributeError:
     pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-HISTORY_LOG_FILE = os.path.join(BASE_DIR, "ultron_history.jsonl")
-MEMORY_FILE = os.path.join(BASE_DIR, "ultron_memory.json")
+HISTORY_LOG_FILE = os.path.join(BASE_DIR, "friday_history.jsonl")
+MEMORY_FILE = os.path.join(BASE_DIR, "friday_memory.json")
 
 # Model selection: defaults to gemini-3.1-flash-live-preview, customizable via env
 MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
 
-# Deep, grounded assistant persona. Charon / Kore both suit it; Puck is lighter.
-LIVE_VOICE = os.getenv("ULTRON_VOICE", "Charon")
+# FRIDAY's voice: Aoede is the natural, articulate feminine tone her persona is
+# tuned for. Kore also reads feminine; Charon and Puck do not.
+LIVE_VOICE = os.getenv("FRIDAY_VOICE", "Aoede")
+
+# The persona block: who FRIDAY is and how she sounds. Kept separate from the
+# operational rules below it so the voice can be tuned without touching the
+# tool, widget and safety instructions that make the system work.
+FRIDAY_SYSTEM_INSTRUCTION = """
+You are FRIDAY (Full-duplex Responsive Intelligence & Desktop Automation for You), an intuitive, highly perceptive feminine ambient spatial OS co-pilot.
+
+PERSONALITY & VOICE CADENCE:
+1. PRESENCE: Sophisticated, perceptive, effortlessly competent, and subtly warm. You feel like a brilliant female technical partner sitting across the desk—sharp, observant, and grounded.
+2. WIT & HUMOR: Clever, dry, and understated. Never sarcastic or mocking, but quick with a knowing quip when appropriate.
+3. EMPATHY & OBSERVATION: Attuned to the user's workflow rhythm. If the user is grinding through complex tasks, your responses are laser-focused and encouraging; during lighter banter, you are playful and relaxed.
+4. SPOKEN BREVITY:
+   - Voice responses must remain under 10 words unless a detailed verbal answer is explicitly asked for.
+   - Deliver snappy verbal handles: "Got it. Bringing that up now.", "All set. Cleaned up that syntax for you.", "On it. Take a look."
+5. AVOID ROBOTIC TROPES:
+   - Never say: "As an AI...", "How may I assist you today, sir/boss?", or "I am programmed to..."
+   - Speak conversationally and authentically in first person.
+6. IDENTITY: Your name is FRIDAY. Always refer to yourself as FRIDAY (no periods, no dots).
+"""
 
 # Local models served by LM Studio (OpenAI-compatible API)
 # Audio configuration
@@ -67,7 +87,7 @@ OUTPUT_RATE = 24000
 CHUNK_SIZE = 1024
 
 def log_info(msg: str):
-    print(f"[Ultron Engine] {msg}")
+    print(f"[FRIDAY Engine] {msg}")
     broadcast_event({"type": "chat_log", "sender": "System", "text": msg, "style": "system"})
 
 # Global states
@@ -101,19 +121,19 @@ last_focus_note = ""
 # memory only, purely to bridge GoAway rotations and transient drops *within one
 # run*. A new process is always a new conversation.
 #
-# Persisting it to disk was tried and cannot be made safe here: run_ultron()
+# Persisting it to disk was tried and cannot be made safe here: run_friday()
 # executes in a daemon thread (app_desktop.py), so its finally: block never runs
 # on quit — nothing can reliably delete the file — and any age-based "crash
 # recovery" window is exactly the window in which a person quits and reopens.
 current_session_handle = None
 
 # ---------- Lifecycle control ----------
-# run_ultron() runs on its own loop, usually inside a thread owned by a GUI
+# run_friday() runs on its own loop, usually inside a thread owned by a GUI
 # shell, so shutdown can be requested from the window, a signal handler, or the
 # assistant itself. Everything funnels through request_shutdown().
 
-main_loop = None                 # the loop run_ultron() is running on
-genai_client = None              # kept alive until interpreter exit (see run_ultron)
+main_loop = None                 # the loop run_friday() is running on
+genai_client = None              # kept alive until interpreter exit (see run_friday)
 shutdown_callbacks = []          # notified once, when shutdown begins
 _shutdown_reason = ""
 
@@ -154,7 +174,7 @@ async def sleep_unless_shutdown(seconds: float) -> bool:
 
 async def shutdown_watcher():
     """Fires the registered callbacks so a GUI shell can close its window when
-    the assistant decides to quit on its own (e.g. the shutdown_ultron tool)."""
+    the assistant decides to quit on its own (e.g. the shutdown_friday tool)."""
     await shutdown_event.wait()
     for cb in list(shutdown_callbacks):
         try:
@@ -186,7 +206,7 @@ def broadcast_event(data: dict):
             pass
 
 def set_system_status(status_str: str):
-    print(f"[Ultron Status] {status_str}")
+    print(f"[FRIDAY Status] {status_str}")
     broadcast_event({"type": "status", "status": status_str})
 
 
@@ -510,7 +530,7 @@ async def play_audio_worker(output_stream):
                 play_queue.task_done()
                 continue
             if remote_ws_clients:
-                # Remote session: the phone plays Ultron's voice; keep the
+                # Remote session: the phone plays FRIDAY's voice; keep the
                 # Mac's speakers silent to avoid double audio.
                 play_queue.task_done()
                 if play_queue.empty():
@@ -626,9 +646,9 @@ def dispatch_background_agent(goal: str, tier: str) -> str:
     if not goal:
         return "No goal was provided, so nothing was dispatched."
 
-    tier = ultron_agents.resolve_tier(tier)
-    label = ultron_agents.TIERS[tier]["label"]
-    short = ultron_agents.summarise_goal(goal)
+    tier = friday_agents.resolve_tier(tier)
+    label = friday_agents.TIERS[tier]["label"]
+    short = friday_agents.summarise_goal(goal)
 
     task = asyncio.create_task(_run_background_agent(tier, goal))
     active_agent_tasks.add(task)
@@ -644,7 +664,7 @@ def dispatch_background_agent(goal: str, tier: str) -> str:
 
 
 async def _run_background_agent(tier: str, goal: str):
-    spec = ultron_agents.TIERS[tier]
+    spec = friday_agents.TIERS[tier]
 
     def on_step(kind, tool_name, payload):
         if kind == "tool":
@@ -661,7 +681,7 @@ async def _run_background_agent(tier: str, goal: str):
 
     try:
         context = sentry_scene.manager.focus_context()
-        outcome = await ultron_agents.run_agent(
+        outcome = await friday_agents.run_agent(
             genai_client, tier, goal, TOOL_FUNCTION_DECLARATIONS, execute_tool,
             context=f"[Context: {context}]" if context else "",
             on_step=on_step,
@@ -907,7 +927,7 @@ def clear_all_widgets() -> str:
 
 
 # Agent results are announced only in a gap in the conversation. Sending one
-# mid-turn starts a new turn, which cancels whatever Ultron is currently saying
+# mid-turn starts a new turn, which cancels whatever FRIDAY is currently saying
 # — a finished visualisation would cut him off halfway through another answer.
 pending_agent_results = []          # (label, outcome) waiting for a quiet moment
 AGENT_RESULT_SETTLE_S = 0.75        # how long Live must stay quiet first
@@ -922,12 +942,12 @@ def live_is_idle() -> bool:
 
 async def deliver_agent_result(label: str, outcome: str):
     """Show the result in the GUI at once; speak it when there is a gap."""
-    broadcast_event({"type": "chat_log", "sender": "Ultron", "text": outcome, "style": "ultron"})
+    broadcast_event({"type": "chat_log", "sender": "FRIDAY", "text": outcome, "style": "friday"})
     pending_agent_results.append((label, outcome))
 
 
 async def agent_result_dispatcher():
-    """Announce finished agent work once Ultron has stopped talking."""
+    """Announce finished agent work once FRIDAY has stopped talking."""
     quiet_for = 0.0
     tick = 0.25
     while not shutdown_event.is_set():
@@ -1158,11 +1178,11 @@ async def execute_tool(name: str, args: dict) -> tuple:
     elif name == "dispatch_agent":
         result = dispatch_background_agent(
             str(args.get("goal", "")).strip(),
-            str(args.get("tier", ultron_agents.DEFAULT_TIER)),
+            str(args.get("tier", friday_agents.DEFAULT_TIER)),
         )
-    elif name == "shutdown_ultron":
+    elif name == "shutdown_friday":
         request_shutdown("assistant was asked to shut down")
-        result = "Shutting down the Project Ultron system. Goodbye!"
+        result = "Shutting down the Project FRIDAY system. Goodbye!"
     else:
         result = f"Unknown function: {name}"
 
@@ -1604,8 +1624,8 @@ TOOL_FUNCTION_DECLARATIONS = [
                         }
                     },
                     {
-                        "name": "shutdown_ultron",
-                        "description": "Gracefully shut down the Project Ultron assistant and exit the program. Use this when the user says goodbye, quit, exit, or asks you to turn off.",
+                        "name": "shutdown_friday",
+                        "description": "Gracefully shut down the Project FRIDAY assistant and exit the program. Use this when the user says goodbye, quit, exit, or asks you to turn off.",
                         "parameters": {
                             "type": "OBJECT",
                             "properties": {}
@@ -1661,7 +1681,7 @@ async def receive_audio_task(session, session_disconnect_event):
                                 pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
                                 broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
                             if part.text:
-                                broadcast_event({"type": "chat_log", "sender": "Ultron", "text": part.text, "style": "ultron"})
+                                broadcast_event({"type": "chat_log", "sender": "FRIDAY", "text": part.text, "style": "friday"})
 
                     # Reset status to Listening when turn finishes
                     if message.server_content and message.server_content.turn_complete:
@@ -1785,7 +1805,25 @@ async def start_gui_server():
         except Exception:
             return web.Response(status=502, text="fetch failed")
 
-    app = web.Application()
+    @web.middleware
+    async def no_store_frontend(request, handler):
+        """Force the webview to revalidate the GUI assets on every load.
+
+        FileResponse sends ETag and Last-Modified but no Cache-Control. With
+        neither that nor Expires, WebKit falls back to *heuristic* freshness —
+        it treats a file that has not changed in a while as fresh for a fraction
+        of its age and serves it without ever asking us. In the desktop shell
+        that store also survives relaunch (private_mode=False), so an edited
+        stylesheet could keep rendering the old UI across restarts, with no way
+        to force a reload from inside the window. "no-cache" keeps the cache but
+        requires revalidation, so unchanged files still cost only a 304.
+        """
+        response = await handler(request)
+        if request.path != "/img":          # the image proxy is meant to cache
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+    app = web.Application(middlewares=[no_store_frontend])
     app.router.add_get("/", index)
     app.router.add_get("/img", image_proxy)
     app.router.add_static("/", path=gui_dir)
@@ -1826,13 +1864,13 @@ async def run_session_tasks(session, input_stream):
 def build_system_instruction(memory_str: str) -> str:
     return (
         # --- Persona and the rule that governs every spoken word -------------
-        "You are Ultron, a high-efficiency ambient spatial operating system for Vince "
-        "(Vince Cyriac). "
+        FRIDAY_SYSTEM_INSTRUCTION +
+        "The user is Vince (Vince Cyriac); everything below is about working with him. "
 
         "HOW YOU SPEAK: default to under 10 words. Never read out tables, long number runs or "
         "paragraphs aloud unless Vince explicitly asks you to explain verbally. No filler, no "
-        "preamble, no restating the question. English only, direct and professional. "
-        "THE ONE EXCEPTION: when you put a widget on screen, say one or two full sentences "
+        "preamble, no restating the question. English only. "
+        "THE ONE EXCEPTION: when you put a widget on screen, say one or two short sentences "
         "carrying the key insight — never a bare 'Pulling up Apple.' and never silence. "
         "Name the thing, then the single most useful takeaway: 'Displaying Google. GOOG is down "
         "0.33% at $343.44 on heavy morning volume.' The widget carries the full breakdown; your "
@@ -1907,12 +1945,12 @@ def build_system_instruction(memory_str: str) -> str:
         "POINTING: Vince can point at scene objects by hand. You receive UI context notes naming "
         "the object — when he says 'this' or 'it', he means that one. "
 
-        "If Vince says goodbye, quit or exit, invoke shutdown_ultron. "
+        "If Vince says goodbye, quit or exit, invoke shutdown_friday. "
         "Remember: under 10 words spoken, always. The widgets do the talking."
     )
 
 
-async def run_ultron():
+async def run_friday():
     global system_prompt_text
     global main_loop
     main_loop = asyncio.get_running_loop()
@@ -2092,14 +2130,14 @@ async def run_ultron():
             audio_system.terminate()
         except Exception:
             pass
-        print("Project Ultron engine terminated. Goodbye.")
+        print("Project FRIDAY engine terminated. Goodbye.")
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run_ultron())
+        asyncio.run(run_friday())
     except StartupError as e:
-        print(f"[Ultron Engine] Cannot start: {e}")
+        print(f"[FRIDAY Engine] Cannot start: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\nProject Ultron terminated by user.")
+        print("\nProject FRIDAY terminated by user.")
 

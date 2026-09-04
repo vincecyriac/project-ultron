@@ -1,5 +1,5 @@
 """
-Desktop shell for Project Ultron.
+Desktop shell for Project FRIDAY.
 
 Owns the process lifecycle: boots the engine on a background loop, shows the
 PyWebView window, and makes sure that however the app ends — window closed,
@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-import ultron_hub
+import friday_hub
 
 GUI_HOST = "127.0.0.1"
 GUI_PORT = 8766
@@ -40,8 +40,8 @@ def start_backend():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(ultron_hub.run_ultron())
-    except ultron_hub.StartupError as e:
+        loop.run_until_complete(friday_hub.run_friday())
+    except friday_hub.StartupError as e:
         backend_error = str(e)
     except Exception as e:
         backend_error = f"{type(e).__name__}: {e}"
@@ -73,10 +73,10 @@ def wait_for_gui(backend, timeout=BOOT_TIMEOUT):
 
 def stop_backend(backend, reason):
     """Ask the engine to stop and give it a bounded amount of time to do so."""
-    ultron_hub.request_shutdown(reason)
+    friday_hub.request_shutdown(reason)
     backend.join(timeout=STOP_TIMEOUT)
     if backend.is_alive():
-        print("[Ultron Desktop] Engine did not stop in time; exiting anyway.")
+        print("[FRIDAY Desktop] Engine did not stop in time; exiting anyway.")
 
 
 def grant_media_capture():
@@ -107,7 +107,7 @@ def grant_media_capture():
         ])
         return True
     except Exception as e:
-        print(f"[Ultron Desktop] Could not auto-grant media capture: {e}")
+        print(f"[FRIDAY Desktop] Could not auto-grant media capture: {e}")
         return False
 
 
@@ -119,7 +119,7 @@ def run_windowed(backend):
     os.makedirs(WEBVIEW_STORAGE, exist_ok=True)
 
     window = webview.create_window(
-        title="Project Ultron - AI Desktop Assistant",
+        title="Project FRIDAY - AI Desktop Assistant",
         url=GUI_URL,
         width=1280,
         height=850,
@@ -129,9 +129,9 @@ def run_windowed(backend):
     )
 
     # User closed the window -> stop the engine.
-    window.events.closed += lambda: ultron_hub.request_shutdown("window closed")
+    window.events.closed += lambda: friday_hub.request_shutdown("window closed")
 
-    # Engine decided to quit (e.g. "goodbye" -> shutdown_ultron) -> close the
+    # Engine decided to quit (e.g. "goodbye" -> shutdown_friday) -> close the
     # window so webview.start() returns and the process can exit on its own.
     def close_window(reason):
         try:
@@ -139,13 +139,13 @@ def run_windowed(backend):
         except Exception:
             pass
 
-    ultron_hub.on_shutdown(close_window)
+    friday_hub.on_shutdown(close_window)
 
     # private_mode=False keeps the data store (and its permission grants) on
     # disk between launches; storage_path pins where that lives.
     webview.start(debug=False, private_mode=False, storage_path=WEBVIEW_STORAGE)
     if not granted:
-        print("[Ultron Desktop] Media capture prompts may still appear.")
+        print("[FRIDAY Desktop] Media capture prompts may still appear.")
     # start() returns once the window is gone, for whichever of the two reasons.
     stop_backend(backend, "window closed")
 
@@ -154,7 +154,7 @@ def run_headless(backend):
     """No PyWebView available: serve the same GUI in the default browser."""
     import webbrowser
 
-    print(f"[Ultron Desktop] Opening Web GUI in default browser: {GUI_URL}")
+    print(f"[FRIDAY Desktop] Opening Web GUI in default browser: {GUI_URL}")
     webbrowser.open(GUI_URL)
     try:
         while backend.is_alive():
@@ -165,12 +165,12 @@ def run_headless(backend):
 
 
 def main():
-    backend = threading.Thread(target=start_backend, name="ultron-engine", daemon=True)
+    backend = threading.Thread(target=start_backend, name="friday-engine", daemon=True)
     backend.start()
 
     # Ctrl+C / kill reach the engine instead of killing the thread mid-write.
     def handle_signal(signum, _frame):
-        ultron_hub.request_shutdown(signal.Signals(signum).name)
+        friday_hub.request_shutdown(signal.Signals(signum).name)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -180,7 +180,7 @@ def main():
 
     if not wait_for_gui(backend):
         reason = backend_error or f"GUI server did not come up within {BOOT_TIMEOUT:.0f}s"
-        print(f"[Ultron Desktop] Engine failed to start: {reason}")
+        print(f"[FRIDAY Desktop] Engine failed to start: {reason}")
         stop_backend(backend, "startup failure")
         return 1
 
@@ -190,12 +190,12 @@ def main():
         run_headless(backend)
         return 0
 
-    print(f"[Ultron Desktop] Launching PyWebView Desktop GUI: {GUI_URL}")
+    print(f"[FRIDAY Desktop] Launching PyWebView Desktop GUI: {GUI_URL}")
     try:
         run_windowed(backend)
     except Exception as e:
         # A real window failure — report it rather than silently degrading.
-        print(f"[Ultron Desktop] Window error: {e}")
+        print(f"[FRIDAY Desktop] Window error: {e}")
         stop_backend(backend, "window error")
         return 1
     return 0

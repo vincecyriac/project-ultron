@@ -19,7 +19,7 @@ WIDGET_MODEL = "gemini-3.7-flash"
 GENERATION_TIMEOUT_S = 45.0
 MAX_HTML_CHARS = 24000
 
-WIDGET_DESIGN_SYSTEM_PROMPT = """You are Ultron's visual interface generator. You output pure, valid, raw HTML for one ambient sci-fi HUD card. No markdown fences, no <script>, no external stylesheets or fonts.
+WIDGET_DESIGN_SYSTEM_PROMPT = """You are FRIDAY's visual interface generator. You output pure, valid, raw HTML for one ambient sci-fi HUD card. No markdown fences, no <script>, no external stylesheets or fonts.
 
 OUTPUT
 Return ONLY the inner HTML that goes inside the card body. No <html>, <head>, <body>, and no card chrome — the title bar already exists.

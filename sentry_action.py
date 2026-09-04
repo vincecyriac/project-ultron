@@ -1,5 +1,5 @@
 """
-sentry_action.py - Desktop UI automation module for Project Ultron.
+sentry_action.py - Desktop UI automation module for Project FRIDAY.
 
 Mouse events are posted through Quartz CGEvent so they work across ALL
 monitors in global desktop coordinates (PyAutoGUI clamps to the primary
@@ -212,7 +212,7 @@ def read_ui_elements() -> str:
         if result.returncode != 0 or not result.stdout.strip():
             err = result.stderr.strip()
             return (f"[Error]: Could not read UI tree: {err or 'empty output'}. "
-                    "Verify Accessibility permission is granted to the terminal/app running Ultron.")
+                    "Verify Accessibility permission is granted to the terminal/app running FRIDAY.")
         out = result.stdout.strip()
         if len(out) > 6000:
             out = out[:6000] + "\n...[truncated]"

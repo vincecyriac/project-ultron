@@ -8,12 +8,12 @@ __pycache__/
 *.pyd
 
 # Local state and session handles
-.ultron_session.json
+.friday_session.json
 .session_handle.json
-ultron_history.jsonl
-ultron_memory.json
-ultron_profiles.json
-ultron_scenes.json
+friday_history.jsonl
+friday_memory.json
+friday_profiles.json
+friday_scenes.json
 
 # Temporary media captures
 *.jpg

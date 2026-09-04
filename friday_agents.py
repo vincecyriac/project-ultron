@@ -1,5 +1,5 @@
 """
-Background agent tier for Project Ultron.
+Background agent tier for Project FRIDAY.
 
 Gemini Live is a conversational surface: it must stay responsive for barge-in,
 so it never runs long multi-step work itself. Instead it acknowledges verbally
@@ -28,7 +28,7 @@ MAX_STEPS = 12          # tool round-trips before the agent must conclude
 STEP_TIMEOUT_S = 120.0  # per model call
 
 _SHARED_RULES = (
-    "You are a background execution agent for Ultron, operating on Vince's macOS machine. "
+    "You are a background execution agent for FRIDAY, operating on Vince's macOS machine. "
     "You were dispatched with one goal and you run without further user input, so never ask "
     "questions — decide and act. Chain as many tool calls as the goal needs, verifying results "
     "as you go. Never perform destructive actions (deleting files, sending messages or emails, "

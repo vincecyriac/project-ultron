@@ -3,7 +3,7 @@
  *
  * Consumes renderer-neutral scene-graph specs + incremental ops from the
  * Python SceneManager (sentry_scene.py) over WebSocket, and renders live,
- * persistent, interactive 3D scenes inside Ultron's GUI.
+ * persistent, interactive 3D scenes inside FRIDAY's GUI.
  *
  * Interaction sources are pluggable (SVE.registerInputSource): mouse/touch
  * via OrbitControls + raycasting today; MediaPipe hands / XR controllers

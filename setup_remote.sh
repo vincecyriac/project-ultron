@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Ultron remote access — Tailscale Serve setup.
+# FRIDAY remote access — Tailscale Serve setup.
 #
-# Exposes the local Ultron GUI (127.0.0.1:8766) and WebSocket gateway
+# Exposes the local FRIDAY GUI (127.0.0.1:8766) and WebSocket gateway
 # (127.0.0.1:8765) over HTTPS *inside your tailnet only*. Nothing is
 # published to the public internet. The hub keeps listening on localhost;
 # Tailscale Serve terminates TLS and proxies in.
@@ -42,7 +42,7 @@ echo
 echo
 HOSTNAME_FQDN=$("$TS" status --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)
 if [ -n "$HOSTNAME_FQDN" ]; then
-  echo "Ultron remote URL:  https://${HOSTNAME_FQDN}/"
+  echo "FRIDAY remote URL:  https://${HOSTNAME_FQDN}/"
   echo "Open this on your phone (Tailscale app connected), add to home screen."
 fi
 echo

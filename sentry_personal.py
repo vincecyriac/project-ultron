@@ -1,5 +1,5 @@
 """
-sentry_personal.py - Calendar and email access for Project Ultron.
+sentry_personal.py - Calendar and email access for Project FRIDAY.
 
 Calendar: native EventKit (pyobjc) — fast, works with every account added to
 macOS (iCloud, Google, Exchange) once Calendar permission is granted.
@@ -50,7 +50,7 @@ def _get_store():
     if not _access_granted:
         raise PermissionError(
             "Calendar access denied. Grant it in System Settings -> Privacy & Security -> Calendars "
-            "for the terminal/app running Ultron, then retry."
+            "for the terminal/app running FRIDAY, then retry."
         )
     return _store
 
@@ -133,7 +133,7 @@ def _run_applescript(script: str, timeout: int = 45) -> str:
         if "not authorized" in err.lower() or "-1743" in err:
             raise PermissionError(
                 "Automation permission for Mail denied. Grant it in System Settings -> "
-                "Privacy & Security -> Automation (allow the terminal/app running Ultron to control Mail)."
+                "Privacy & Security -> Automation (allow the terminal/app running FRIDAY to control Mail)."
             )
         raise RuntimeError(err or "AppleScript failed")
     return result.stdout.strip()

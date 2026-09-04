@@ -1,5 +1,5 @@
 /**
- * Holographic Orb — Ultron's ambient presence.
+ * Holographic Orb — FRIDAY's ambient presence.
  *
  * A self-contained Three.js scene (own WebGL context, independent of the SVE
  * renderer) that expresses system state purely through colour and energy:
@@ -9,6 +9,9 @@
  *   thinking  glowing amber    #FFB800
  *   speaking  neon emerald     #00FF88
  *   offline   dim ember        #E5726F
+ *
+ * Over all five, a fixed violet/blush accent (#A18CD1 -> #FBC2EB) tints the rim
+ * and the outer bloom. It carries no state — it is purely FRIDAY's finish.
  *
  * The core is an additively-blended plasma sphere wrapped in two fresnel glow
  * shells (a shader-side stand-in for a bloom pass — no post-processing deps)
@@ -51,6 +54,12 @@ let orbGroup = null;
 const clock = new THREE.Clock();
 
 let currentState = "idle";
+// Persona accents. These never encode state — they are a fixed violet-to-blush
+// tint laid over the silhouette and the outer bloom, so the orb reads warm and
+// luminous while the state hue below it stays exactly as legible as before.
+const ACCENT_VIOLET = new THREE.Color("#A18CD1");
+const ACCENT_BLUSH  = new THREE.Color("#FBC2EB");
+
 const colorCurrent = new THREE.Color(STATE_COLORS.idle);
 const colorTarget = new THREE.Color(STATE_COLORS.idle);
 
@@ -156,6 +165,8 @@ void main() {
 
 const CORE_FRAG = /* glsl */ `
 uniform vec3 uColor;
+uniform vec3 uAccent;
+uniform vec3 uAccent2;
 uniform float uLevel;
 uniform float uTime;
 varying vec3 vNormal;
@@ -181,7 +192,13 @@ void main() {
   // A constant rim keeps the hot silhouette, and normalising by the peak
   // channel keeps the R:G:B ratio — and therefore the hue — exactly fixed
   // while energy still changes how bright the orb reads.
-  vec3 col = uColor * e + vec3(1.0) * pow(rim, 2.4) * 0.12;
+  // The rim highlight was pure white; it is now a violet-to-blush tint, which
+  // is what gives the orb its warmer finish. The two properties that keep the
+  // state hue readable are untouched: the highlight is still a constant (never
+  // scaled by uLevel, so louder still means brighter and never washed out) and
+  // the peak-channel normalisation below still fixes the body's R:G:B ratio.
+  vec3 rimTint = mix(uAccent, uAccent2, pow(rim, 1.6));
+  vec3 col = uColor * e + rimTint * pow(rim, 2.4) * 0.16;
   float peak = max(col.r, max(col.g, col.b));
   if (peak > 1.0) col /= peak;
 
@@ -202,6 +219,8 @@ void main() {
 
 const GLOW_FRAG = /* glsl */ `
 uniform vec3 uColor;
+uniform vec3 uAccent;
+uniform float uAccentMix;
 uniform float uLevel;
 uniform float uPower;
 uniform float uStrength;
@@ -209,7 +228,9 @@ varying vec2 vUv;
 void main() {
   float r = length(vUv - 0.5) * 2.0;
   float g = pow(max(0.0, 1.0 - r), uPower) * uStrength * (0.72 + uLevel * 0.22);
-  gl_FragColor = vec4(uColor * g, g);
+  // The further out the shell, the more it leans violet — the state colour stays
+  // dominant where the orb is bright, the accent only owns the faint outer bloom.
+  gl_FragColor = vec4(mix(uColor, uAccent, uAccentMix) * g, g);
 }
 `;
 
@@ -287,12 +308,14 @@ function buildParticles() {
   return new THREE.Points(geo, mat);
 }
 
-function glowSprite(size, power, strength, order) {
+function glowSprite(size, power, strength, order, accentMix) {
   const mesh = new THREE.Mesh(
     new THREE.PlaneGeometry(size, size),
     new THREE.ShaderMaterial({
       uniforms: {
         uColor: { value: colorCurrent },
+        uAccent: { value: ACCENT_VIOLET },
+        uAccentMix: { value: accentMix },
         uLevel: { value: 0 },
         uPower: { value: power },
         uStrength: { value: strength },
@@ -333,6 +356,8 @@ function init() {
         uTime: { value: 0 },
         uLevel: { value: 0 },
         uColor: { value: colorCurrent },
+        uAccent: { value: ACCENT_VIOLET },
+        uAccent2: { value: ACCENT_BLUSH },
       },
       vertexShader: CORE_VERT,
       fragmentShader: CORE_FRAG,
@@ -345,8 +370,8 @@ function init() {
   orbGroup.add(coreMesh);
 
   // Kept off orbGroup: a rotating quad would turn edge-on and vanish.
-  haloMesh = glowSprite(3.9, 2.2, 0.85, -1);
-  aureoleMesh = glowSprite(4.7, 3.2, 0.42, -2);
+  haloMesh = glowSprite(3.9, 2.2, 0.85, -1, 0.18);
+  aureoleMesh = glowSprite(4.7, 3.2, 0.42, -2, 0.42);
   scene.add(haloMesh, aureoleMesh);
 
   particles = buildParticles();
@@ -414,7 +439,7 @@ function tick() {
 
 // ---------- Public API ----------
 
-window.UltronOrb = {
+window.FridayOrb = {
   /** Switch state: idle | listening | thinking | speaking | offline.
    *  Colour and animation follow from the state and hold until it changes. */
   setState(name) {
