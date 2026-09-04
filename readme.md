@@ -1,4 +1,4 @@
-# Project Ultron
+# Project FRIDAY
 
 > **An Autonomous, Multimodal AI Desktop Assistant & Spatial Operating System for macOS**
 > Voice-first, Gemini-only. A holographic orb you talk to, a deck of live data widgets it composes for you, an interactive 3D spatial engine, and deep native OS control — with background agents doing the heavy lifting off the audio path.
@@ -7,11 +7,11 @@
 
 ## 🌟 Overview
 
-**Project Ultron** is a personal, multimodal desktop intelligence system for macOS. You speak; it answers in under ten words and puts the substance on screen. Detail lives in widgets — charts, metric matrices, intelligence feeds, embedded web pages, live 3D scenes — never in a wall of narration.
+**Project FRIDAY** is a personal, multimodal desktop intelligence system for macOS. You speak; it answers in under ten words and puts the substance on screen. Detail lives in widgets — charts, metric matrices, intelligence feeds, embedded web pages, live 3D scenes — never in a wall of narration.
 
 ### Core Highlights
 
-- 🎙️ **Real-Time Voice Streaming** — Full-duplex conversational audio over the Gemini Live WebSocket API (`gemini-3.1-flash-live-preview`), 16 kHz PCM in / 24 kHz out, with natural barge-in. Deep, grounded **Charon** voice by default.
+- 🎙️ **Real-Time Voice Streaming** — Full-duplex conversational audio over the Gemini Live WebSocket API (`gemini-3.1-flash-live-preview`), 16 kHz PCM in / 24 kHz out, with natural barge-in. Natural, articulate **Aoede** voice by default.
 - 🔮 **Ambient Holographic Orb** — A Three.js plasma core that *is* the status display. Colour is bound to state and holds steady until the state changes; motion reacts to what you actually hear.
 - 🧩 **Async Widget Deck** — Asking for data mounts a shimmering skeleton card *instantly*; a background generator writes the finished HTML — hero figures, inline SVG charts, metric matrices — and it hydrates in place a few seconds later. The voice never waits on layout.
 - 🤖 **Tiered Background Agents** — Live stays responsive for barge-in and dispatches multi-step work to specialised models: **Gemini 3.1 Pro** for macOS automation, **Gemini 3.7 Flash** for spatial scene generation.
@@ -34,17 +34,17 @@ The GUI is a spatial workspace with no chrome — no title bar, no tabs, no stat
 │                                                                          │
 │      ╭─────────╮        ┌──────────────────────────────────────────────┐ │
 │      │  ORB    │        │  ALPHABET INC.                            ×  │ │
-│      │ (state) │        │  207.42  USD              ▲ +3.81 +1.87%    │ │
+│      │ (state) │        │  207.42  USD              ▲ +3.81 +1.87%     │ │
 │      ╰─────────╯        │  ╭────────────────────────────────────────╮  │ │
 │                         │  │  gradient area chart, dashed baseline  │  │ │
 │    ← 260px rail         │  ╰────────────────────────────────────────╯  │ │
-│                         │  OPEN 204.10   HIGH 209.94   LOW 203.44     │ │
+│                         │  OPEN 204.10   HIGH 209.94   LOW 203.44      │ │
 │                         └──────────────────────────────────────────────┘ │
 │  ┌───────────┐          ┌──────────────────────────────────────────────┐ │
 │  │ camera PIP│          │  MARKET INTELLIGENCE                      ×  │ │
 │  │ (mirrored)│          │  01 [ALERT] Antitrust ruling lands Tuesday   │ │
 │  └───────────┘          └──────────────────────────────────────────────┘ │
-│  ╭ Speak, or type… ╮                                   ╭─ 🎙 📷 🖥 ─╮   │
+│  ╭ Speak, or type… ╮                                   ╭─ 🎙 📷 🖥 ─╮     │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,8 +68,10 @@ State drives colour; colour holds until the state changes. Nothing else can shif
 | Idle | `#00F2FE` calm cyan | Connected, waiting |
 | Listening | `#0077FF` deep blue | Your voice is coming in |
 | Thinking | `#FFB800` amber | Tool running or agent working |
-| Speaking | `#00FF88` emerald | Ultron is talking |
+| Speaking | `#00FF88` emerald | FRIDAY is talking |
 | Offline | `#E5726F` ember | Hub unreachable |
+
+Over all five, a fixed violet-to-blush accent (`#A18CD1` → `#FBC2EB`) tints the rim highlight and the outer bloom. It carries no state — it is purely FRIDAY's finish, and the state hue stays exactly as readable as before.
 
 The "speaking" state follows the hub's authoritative turn status and the **playback timeline** — audio arrives roughly 3× faster than it plays, so the orb animates in step with what you *hear*, not with what has downloaded. Tap the orb to interrupt.
 
@@ -86,20 +88,20 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 ## 🏗️ System Architecture
 
 ```
-                        ┌─────────────────────────────────────────────────────────┐
-                        │                  USER INTERFACES                        │
-                        │  • Web GUI (Orb / Widget Deck / Spatial 3D / Gestures)  │
-                        │  • PyWebView desktop shell  • Phone via Tailscale HTTPS │
-                        │  • Voice In / Out (16 kHz PCM Mic / 24 kHz Speaker)     │
-                        └───────────────▲─────────────────────────▲───────────────┘
-                                        │ (WebSocket / Audio)     │ (Touch / Video)
-                                        ▼                         ▼
+            ┌─────────────────────────────────────────────────────────┐
+            │                  USER INTERFACES                        │
+            │  • Web GUI (Orb / Widget Deck / Spatial 3D / Gestures)  │
+            │  • PyWebView desktop shell  • Phone via Tailscale HTTPS │
+            │  • Voice In / Out (16 kHz PCM Mic / 24 kHz Speaker)     │
+            └───────────────▲─────────────────────────▲───────────────┘
+                            │ (WebSocket / Audio)     │ (Touch / Video)
+                            ▼                         ▼
 ┌───────────────────────────────────────────────────────────────────────────────────────────┐
-│                                ULTRON ENGINE HUB (ultron_hub.py)                          │
+│                                FRIDAY ENGINE HUB (friday_hub.py)                          │
 │                                                                                           │
 │  ┌───────────────────────────┐  ┌───────────────────────────┐  ┌────────────────────────┐ │
 │  │    Audio Pipeline         │  │   State & Event Hub       │  │  Gemini Live Session   │ │
-│  │ • PyAudio 16kHz/24kHz     │  │ • Play Queue / Interrupts │  │ • Charon voice, tools  │ │
+│  │ • PyAudio 16kHz/24kHz     │  │ • Play Queue / Interrupts │  │ • Aoede voice, tools   │ │
 │  │ • Voice Enrollment Buffer │  │ • Widget Deck Registry    │  │ • Per-turn receive loop│ │
 │  │ • Remote Audio Routing    │  │ • Approval State Machine  │  │ • In-run resumption    │ │
 │  └───────────────────────────┘  └───────────────────────────┘  └────────────────────────┘ │
@@ -108,11 +110,11 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
        ▼                    ▼                   ▼                        ▼
 ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
 │ CAPABILITY       │ │ BACKGROUND AGENTS│ │ SPATIAL ENGINE (SVE) │ │ RECOGNITION & MEMORY │
-│ SUBSYSTEMS       │ │ ultron_agents.py │ │                      │ │                      │
+│ SUBSYSTEMS       │ │ friday_agents.py │ │                      │ │                      │
 │                  │ │                  │ │ • sentry_scene.py    │ │ • sentry_recognition │
 │ • sentry_vision  │ │ • os tier        │ │   SceneGraph deltas  │ │   YuNet + SFace 128-d│
 │ • sentry_action  │ │   Gemini 3.1 Pro │ │ • web_gui/sve.js     │ │   Mel MFCC voice     │
-│ • sentry_exec    │ │ • spatial tier   │ │   Three.js renderer  │ │ • ultron_memory.json │
+│ • sentry_exec    │ │ • spatial tier   │ │   Three.js renderer  │ │ • friday_memory.json │
 │ • sentry_personal│ │ • widget writer  │ │ • web_gui/gestures.js│ │   Persistent facts   │
 │ • sentry_web     │ │   Gemini 3.7 Fl. │ │   MediaPipe hands    │ │                      │
 └──────────────────┘ └──────────────────┘ └──────────────────────┘ └──────────────────────┘
@@ -122,14 +124,16 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 
 ## 🧩 Core Subsystems
 
-### 1. Gemini Live Hub (`ultron_hub.py`)
-- **Bidirectional voice** over WebSockets to `gemini-3.1-flash-live-preview`, typed `LiveConnectConfig` with the **Charon** prebuilt voice (override with `ULTRON_VOICE`).
+### 1. Gemini Live Hub (`friday_hub.py`)
+- **Bidirectional voice** over WebSockets to `gemini-3.1-flash-live-preview`, typed `LiveConnectConfig` with the **Aoede** prebuilt voice (override with `FRIDAY_VOICE`).
 - **Per-turn receive loop** — `session.receive()` yields one conversational turn and ends, so the loop re-enters it. Without that the session tears down after every reply and the reconnect replays the last turn.
 - **Session lifecycle** — the resumption handle is held **in memory only**, bridging GoAway rotations and drops *within* a run. A new process is always a new conversation.
-- **Concise persona** — spoken replies stay under ten words; when a widget is mounted, one or two sentences carrying the key takeaway. Detail belongs on screen.
+- **Persona** — `FRIDAY_SYSTEM_INSTRUCTION` holds who she is and how she sounds: perceptive, effortlessly competent, dryly witty, subtly warm. It is a standalone constant, composed with the operational rules by `build_system_instruction()`, so the voice can be retuned without touching the tool, widget and safety instructions.
+- **Frontend assets are never cached stale** — the GUI server sends `Cache-Control: no-cache, must-revalidate`. Without it WKWebView applies heuristic freshness and can keep rendering an old `app.js`/`style.css` across relaunches (the desktop shell runs `private_mode=False`, so its store survives restarts). ETags are kept, so unchanged files still cost only a 304.
+- **Concise by default** — spoken replies stay under ten words; when a widget is mounted, one or two sentences carrying the key takeaway. Detail belongs on screen.
 
-### 2. Background Agent Tiers (`ultron_agents.py`)
-Live must stay free for barge-in, so anything multi-step is dispatched off the audio path via `dispatch_agent`. Ultron acknowledges in the same turn ("Working on that now.") and announces the result when it lands.
+### 2. Background Agent Tiers (`friday_agents.py`)
+Live must stay free for barge-in, so anything multi-step is dispatched off the audio path via `dispatch_agent`. FRIDAY acknowledges in the same turn ("Working on that now.") and announces the result when it lands.
 
 | Tier | Model | Handles |
 |---|---|---|
@@ -137,9 +141,9 @@ Live must stay free for barge-in, so anything multi-step is dispatched off the a
 | `spatial` | `gemini-3.7-flash` | Building and editing 3D SVE scenes |
 | widget generator | `gemini-3.7-flash` | Writing card HTML (see below) |
 
-Agents reuse the hub's own tool implementations, run up to 12 tool round-trips, and report back a single spoken sentence. Results are **queued for a gap in the conversation** — a finished agent can never cut Ultron off mid-sentence.
+Agents reuse the hub's own tool implementations, run up to 12 tool round-trips, and report back a single spoken sentence. Results are **queued for a gap in the conversation** — a finished agent can never cut FRIDAY off mid-sentence.
 
-### 3. Async Widget Deck (`ultron_hub.py`, `widget_generator_agent.py`, `web_gui/app.js`)
+### 3. Async Widget Deck (`friday_hub.py`, `widget_generator_agent.py`, `web_gui/app.js`)
 
 Composing a data-dense card takes seconds. Doing that inside the voice turn would stall the conversation, so the work is split in two:
 
@@ -180,11 +184,11 @@ Measured end to end: the tool returns at **+0.00s**, the skeleton is on screen i
 - **Shell and AppleScript execution** with timeouts and the remote approval gate.
 
 ### 6. Biometric Face & Voice Recognition (`sentry_recognition.py`)
-- OpenCV **YuNet** ONNX detection + **SFace** 128-d embeddings, cosine-matched against `ultron_profiles.json`.
+- OpenCV **YuNet** ONNX detection + **SFace** 128-d embeddings, cosine-matched against `friday_profiles.json`.
 - **Voice fingerprinting** — pure-NumPy MFCCs pooled by mean and variance from the rolling mic buffer.
 
 ### 7. Spatial Visualization Engine (`sentry_scene.py`, `web_gui/sve.js`, `web_gui/gestures.js`)
-- **Persistent 3D workspace** — scenes live in `ultron_scenes.json` and stay on stage until dismissed.
+- **Persistent 3D workspace** — scenes live in `friday_scenes.json` and stay on stage until dismissed.
 - **Incremental delta protocol** — update, rotate, recolour, highlight, hide, or explode individual objects; never a full rebuild.
 - **Screen-sized labels** — annotations are sized to a constant on-screen height, depth-tested so geometry occludes them, and decluttered by screen-space overlap (12 visible at once, nearest first).
 - **Markerless hand tracking** — vendored MediaPipe HandLandmarker WASM: point to hover, pinch to grab, pinch empty space to orbit, two-hand pinch to zoom.
@@ -229,7 +233,7 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 | **Widget Deck** | `create_skeleton_widget`, `dismiss_widget`, `clear_all_widgets` |
 | **Delegation** | `dispatch_agent` |
 | **Productivity & Web** | `get_calendar_events`, `create_calendar_event`, `get_recent_emails`, `search_emails`, `fetch_webpage` |
-| **System Lifecycle** | `shutdown_ultron` |
+| **System Lifecycle** | `shutdown_friday` |
 
 ---
 
@@ -263,8 +267,8 @@ Grant these in **System Settings → Privacy & Security**:
 ### 3. Installation
 
 ```bash
-git clone https://github.com/vincecyriac/project_ultron.git
-cd project_ultron
+git clone https://github.com/vincecyriac/project_friday.git
+cd project_friday
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -283,11 +287,12 @@ GEMINI_API_KEY=your_gemini_api_key_here
 # Gemini Live model (voice + realtime)
 GEMINI_MODEL=gemini-3.1-flash-live-preview
 
-# Assistant voice: Charon (default), Kore, Puck
-ULTRON_VOICE=Charon
+# FRIDAY's voice: Aoede (default) or Kore — both feminine.
+# Charon and Puck are masculine and will not match her persona.
+FRIDAY_VOICE=Aoede
 ```
 
-### 5. Running Ultron
+### 5. Running FRIDAY
 
 **Desktop app** (PyWebView window, persistent camera/mic permissions):
 
@@ -298,7 +303,7 @@ ULTRON_VOICE=Charon
 **Headless engine** (serve the GUI to a browser instead):
 
 ```bash
-.venv/bin/python ultron_hub.py
+.venv/bin/python friday_hub.py
 ```
 
 Then open 👉 **`http://127.0.0.1:8766`**
@@ -330,9 +335,9 @@ Reset sharing with `tailscale serve reset`.
 ## 📁 Repository Structure
 
 ```
-project_ultron/
-├── ultron_hub.py              # Async hub: audio, WebSocket, Live session, widget deck
-├── ultron_agents.py           # Background agent tiers (os / spatial) and their tool loop
+project_friday/
+├── friday_hub.py              # Async hub: audio, WebSocket, Live session, widget deck
+├── friday_agents.py           # Background agent tiers (os / spatial) and their tool loop
 ├── widget_generator_agent.py  # Card HTML synthesis + output sanitiser
 ├── app_desktop.py             # PyWebView desktop shell + process lifecycle
 ├── sentry_vision.py           # Quartz multi-monitor capture & coordinate tracking
@@ -359,11 +364,11 @@ project_ultron/
 
 | File | Holds |
 |---|---|
-| `ultron_memory.json` | Persistent facts Ultron has been asked to remember |
-| `ultron_profiles.json` | Face and voice embeddings for identity recognition |
-| `ultron_scenes.json` | Saved 3D scene graphs |
+| `friday_memory.json` | Persistent facts FRIDAY has been asked to remember |
+| `friday_profiles.json` | Face and voice embeddings for identity recognition |
+| `friday_scenes.json` | Saved 3D scene graphs |
 | `.session_handle.json` | Live session resumption handle |
-| `ultron_history.jsonl` | Local interaction log |
+| `friday_history.jsonl` | Local interaction log |
 
 ---
 

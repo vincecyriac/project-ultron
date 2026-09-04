@@ -1,5 +1,5 @@
 """
-sentry_scene.py - Spatial Visualization Engine (SVE) backend for Project Ultron.
+sentry_scene.py - Spatial Visualization Engine (SVE) backend for Project FRIDAY.
 
 Replaces HTML visualization generation with a persistent scene-graph
 architecture. The LLM emits structured object specs (JSON), this module
@@ -8,7 +8,7 @@ validates and stores them, and the GUI's Three.js layer renders them live.
 Pipeline:  LLM tool call -> SceneManager (validate + persist + diff)
            -> WebSocket ops broadcast -> GUI renderer (incremental update)
 
-Scenes persist in ultron_scenes.json across restarts. Edits are expressed
+Scenes persist in friday_scenes.json across restarts. Edits are expressed
 as object-level operations (add/update/remove/highlight/hide/show/focus/
 camera) so the renderer never rebuilds a whole scene for a small change.
 
@@ -22,7 +22,7 @@ import json
 import time
 import uuid
 
-SCENES_FILE = "ultron_scenes.json"
+SCENES_FILE = "friday_scenes.json"
 
 VALID_TYPES = {
     "sphere", "box", "cylinder", "cone", "torus", "ring", "plane",

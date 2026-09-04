@@ -1,5 +1,5 @@
 """
-sentry_recognition.py - Face and voice recognition module for Project Ultron.
+sentry_recognition.py - Face and voice recognition module for Project FRIDAY.
 
 Face pipeline: YuNet ONNX face detection -> SFace ONNX 128-d embeddings
 (cosine similarity). Replaces the old raw-pixel L2 approach, giving
@@ -19,7 +19,7 @@ import subprocess
 import numpy as np
 import cv2
 
-PROFILES_FILE = "ultron_profiles.json"
+PROFILES_FILE = "friday_profiles.json"
 YUNET_MODEL_PATH = "face_detection_yunet.onnx"
 SFACE_MODEL_PATH = "face_recognition_sface.onnx"
 YUNET_MODEL_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"

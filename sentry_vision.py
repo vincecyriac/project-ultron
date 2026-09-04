@@ -1,5 +1,5 @@
 """
-sentry_vision.py - Screen and webcam capture for Project Ultron.
+sentry_vision.py - Screen and webcam capture for Project FRIDAY.
 
 Multi-monitor aware: enumerates displays via Quartz, captures the ACTIVE
 display (the one holding the mouse cursor) by default, a specific display

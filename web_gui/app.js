@@ -1,5 +1,5 @@
 /**
- * Ultron — frontend engine.
+ * FRIDAY — frontend engine.
  *
  * WebSocket bridge to the Python backend: 16 kHz PCM mic capture, 24 kHz voice
  * playback with barge-in flush, sensor toggles, live system telemetry, and the
@@ -22,7 +22,7 @@ let audioAnalyser = null;
 let audioDataArray = null;
 
 // Remote = served through Tailscale (HTTPS, non-localhost). Remote clients
-// play Ultron's voice in the browser; local ones rely on the Mac's speakers.
+// play FRIDAY's voice in the browser; local ones rely on the Mac's speakers.
 const IS_REMOTE = !["127.0.0.1", "localhost", ""].includes(window.location.hostname);
 
 // ---------- DOM ----------
@@ -68,7 +68,7 @@ let backendSpeaking = false;  // hub says a model turn is producing audio
 
 const SPEAK_HOLD_MS = 450;
 const MIC_GATE = 0.055;
-// Ultron's voice comes out of the Mac's speakers via PyAudio, which the
+// FRIDAY's voice comes out of the Mac's speakers via PyAudio, which the
 // browser's echoCancellation cannot remove — it only cancels what the browser
 // itself plays. So the mic keeps hearing him for a moment after he stops, and
 // that must not be mistaken for the user talking.
@@ -96,7 +96,7 @@ function resolveOrbState() {
 
 function pumpOrb() {
   requestAnimationFrame(pumpOrb);
-  const orb = window.UltronOrb;
+  const orb = window.FridayOrb;
   if (!orb) return;
 
   // Mic envelope (RMS over the analyser bins), only meaningful while unmuted.
@@ -130,7 +130,7 @@ function pumpOrb() {
   else orb.setLevel(micLevel * 0.6);
 }
 
-// The hub streams Ultron's voice as fast as the model generates it — measured
+// The hub streams FRIDAY's voice as fast as the model generates it — measured
 // at ~35s of speech delivered in under 10s. Animating on arrival therefore ran
 // the orb dry while he was still audibly talking. Instead every chunk is placed
 // on a playback timeline and the orb reads whichever chunk is *being heard now*.
@@ -256,7 +256,7 @@ function agentDone(tier, result) {
 
 let captionTimer = null;
 
-function showCaption(text, kind = "ultron") {
+function showCaption(text, kind = "friday") {
   if (!text) return;
   clearTimeout(captionTimer);
   captionEl.textContent = text;
@@ -327,8 +327,8 @@ function handleServerMessage(msg) {
 
     case "chat_log":
       // System log lines stay out of the UI — the orb carries system state.
-      if (msg.style === "system") console.info("[Ultron]", msg.text);
-      else showCaption(msg.text, msg.style === "user" ? "user" : "ultron");
+      if (msg.style === "system") console.info("[FRIDAY]", msg.text);
+      else showCaption(msg.text, msg.style === "user" ? "user" : "friday");
       break;
 
     case "sve_workspace":
@@ -342,7 +342,7 @@ function handleServerMessage(msg) {
     case "camera_frame":
       // Backend JPEG frames feed Gemini; preview uses the local 30fps
       // getUserMedia stream instead. Fallback to JPEGs only if that failed.
-      if (msg.image_base64 && !UltronCamera.active()) {
+      if (msg.image_base64 && !FridayCamera.active()) {
         camImgEl.src = "data:image/jpeg;base64," + msg.image_base64;
         camImgEl.style.display = "block";
         camPlaceholder.style.display = "none";
@@ -966,7 +966,7 @@ function ensureSveControls() {
   sveStageEl.appendChild(bar);
 
   bar.querySelector("#btn-hands").addEventListener("click", () => {
-    const g = window.UltronGestures;
+    const g = window.FridayGestures;
     if (!g) return;
     g.running ? g.stop() : g.start();
   });
@@ -979,7 +979,7 @@ function ensureSveControls() {
 
 // gestures.js can no longer bind the pill itself (it is built on demand), so
 // mirror its state here.
-window.addEventListener("ultron-gesture-state", (e) => {
+window.addEventListener("friday-gesture-state", (e) => {
   document.getElementById("btn-hands")?.classList.toggle("active", !!e.detail.running);
 });
 
@@ -992,7 +992,7 @@ function pumpRenderers(durationMs = 720) {
   cancelAnimationFrame(resizePump);
   const until = performance.now() + durationMs;
   const step = () => {
-    window.UltronOrb?.resize();
+    window.FridayOrb?.resize();
     window.SVE?.resize?.();
     if (performance.now() < until) resizePump = requestAnimationFrame(step);
   };
@@ -1032,7 +1032,7 @@ let remoteCamFacing = "environment"; // phone default: rear camera (show surroun
 // re-acquire inside that window reuses it instead of calling getUserMedia again.
 const CAMERA_LINGER_MS = 4000;
 
-const UltronCamera = {
+const FridayCamera = {
   stream: null,
   refs: 0,
   _lingerTimer: null,
@@ -1086,18 +1086,18 @@ const UltronCamera = {
     return !!this.stream;
   },
 };
-window.UltronCamera = UltronCamera;
+window.FridayCamera = FridayCamera;
 
 let previewOn = false;
 
 // PIP tiles render only while their source is live.
 function updateFeedCards() {
-  const gestures = window.UltronGestures?.running;
+  const gestures = window.FridayGestures?.running;
   camFeedCard.style.display = (previewOn || isCamActive || gestures) ? "" : "none";
   screenFeedCard.style.display = isScreenActive ? "" : "none";
 }
 
-window.addEventListener("ultron-gesture-state", (e) => {
+window.addEventListener("friday-gesture-state", (e) => {
   if (e.detail.running) {
     startLocalPreview();
   } else if (!isCamActive) {
@@ -1109,7 +1109,7 @@ window.addEventListener("ultron-gesture-state", (e) => {
 async function startLocalPreview() {
   if (previewOn) return;
   try {
-    camVideoEl.srcObject = await UltronCamera.acquire();
+    camVideoEl.srcObject = await FridayCamera.acquire();
     previewOn = true;
     camVideoEl.style.display = "block";
     camImgEl.style.display = "none";
@@ -1124,7 +1124,7 @@ function stopLocalPreview() {
   previewOn = false;
   camVideoEl.srcObject = null;
   camVideoEl.style.display = "none";
-  UltronCamera.release();
+  FridayCamera.release();
 }
 
 function updateSenseState(camActive, screenActive) {
@@ -1137,7 +1137,7 @@ function updateSenseState(camActive, screenActive) {
     if (IS_REMOTE) startRemoteCamPush();
   } else {
     stopRemoteCamPush();
-    if (!window.UltronGestures?.running) {
+    if (!window.FridayGestures?.running) {
       stopLocalPreview();
       camImgEl.style.display = "none";
       camPlaceholder.style.display = "block";
@@ -1193,7 +1193,7 @@ if (IS_REMOTE && camFlipBtn) {
   camFlipBtn.addEventListener("click", async () => {
     remoteCamFacing = remoteCamFacing === "environment" ? "user" : "environment";
     try {
-      const stream = await UltronCamera.restart();
+      const stream = await FridayCamera.restart();
       if (stream) camVideoEl.srcObject = stream;
     } catch (e) {
       console.warn("Camera flip failed:", e);
@@ -1258,7 +1258,7 @@ function arrayBufferToBase64(buffer) {
 }
 
 // ---------- Remote audio playback (phone / Tailscale clients) ----------
-// The hub broadcasts Ultron's voice as 24kHz PCM16; remote devices have no
+// The hub broadcasts FRIDAY's voice as 24kHz PCM16; remote devices have no
 // path to the Mac's speakers, so schedule the chunks through Web Audio here.
 
 let playbackCtx = null;
@@ -1448,7 +1448,7 @@ function syncGesturesToWorkspace() {
     sendWidgetAction("dismiss_widget", { widget_id: SVE_WIDGET_ID });
   }
 
-  const g = window.UltronGestures;
+  const g = window.FridayGestures;
   if (!g || !window.SVE) return;
   if (hasScene) {
     if (!g.running && !g.starting) g.start();

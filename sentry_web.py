@@ -1,5 +1,5 @@
 """
-sentry_web.py - Web page reader for Project Ultron.
+sentry_web.py - Web page reader for Project FRIDAY.
 
 The Gemini Live session already has the google_search grounding tool for
 queries; this module complements it by fetching a specific URL and

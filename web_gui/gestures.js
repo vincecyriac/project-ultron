@@ -350,7 +350,7 @@ function endGrab() {
 // ---------- Toggle ----------
 
 function notifyState() {
-  window.dispatchEvent(new CustomEvent("ultron-gesture-state", { detail: { running } }));
+  window.dispatchEvent(new CustomEvent("friday-gesture-state", { detail: { running } }));
 }
 
 async function startHands() {
@@ -359,7 +359,7 @@ async function startHands() {
   try {
     setHud("Loading hand tracker…");
     await ensureLandmarker();
-    const stream = await window.UltronCamera.acquire();
+    const stream = await window.FridayCamera.acquire();
     video = document.createElement("video");
     video.muted = true;
     video.playsInline = true;
@@ -380,7 +380,7 @@ async function startHands() {
     if (video) {
       video.srcObject = null;
       video = null;
-      window.UltronCamera.release();
+      window.FridayCamera.release();
     }
     running = false;
   } finally {
@@ -403,7 +403,7 @@ function stopHands() {
     video.srcObject = null;
   }
   video = null;
-  window.UltronCamera.release();
+  window.FridayCamera.release();
   btn?.classList.remove("active");
   hideCursor();
   clearMarkings();
@@ -413,7 +413,7 @@ function stopHands() {
 
 btn?.addEventListener("click", () => (running ? stopHands() : startHands()));
 
-window.UltronGestures = {
+window.FridayGestures = {
   start: startHands,
   stop: stopHands,
   get running() { return running; },
