@@ -25,6 +25,20 @@
 
 ## 🖥️ The Interface
 
+### Workspace tabs
+
+The workspace is split in two, behind a tab bar carrying live counts:
+
+- **Cards** — HTML and component widgets, stacked newest-on-top and scrollable, exactly as before.
+- **3D** — every 3D surface, whether an SVE scene (`3d_spatial`) or a generated Tripo asset (`3d_asset`). **Only one is visible at a time**, filling the full workspace height. The rest stay mounted with their WebGL context and camera intact but stop rendering, so nothing is re-loaded when you switch back.
+
+Switch by clicking a pill above the stage, or ask FRIDAY — `show_3d_view` takes `'spatial'` for the scene or a model's name, and is the only thing that moves the selection. A newly arrived model claims the slot and raises the 3D tab, the same way a new card raises Cards. Re-showing a saved model reuses its card (ids are derived from the file), so asking for the same one twice never stacks a second pill.
+
+Hand tracking follows the visible model: switching to the scene hands gestures back to the SVE, switching to a model points them at that model.
+
+Both 3D types share one chrome: the pills name them, so neither card carries its own header, and both use the same floating **Hands** / **Reset view** pills over a full-height stage.
+
+
 The GUI is a spatial workspace with no chrome — no title bar, no tabs, no status text. Every surface owns a reserved region, so nothing ever overlaps.
 
 ```
@@ -193,11 +207,22 @@ Measured end to end: the tool returns at **+0.00s**, the skeleton is on screen i
 - **Screen-sized labels** — annotations are sized to a constant on-screen height, depth-tested so geometry occludes them, and decluttered by screen-space overlap (12 visible at once, nearest first).
 - **Markerless hand tracking** — vendored MediaPipe HandLandmarker WASM: point to hover, pinch to grab, pinch empty space to orbit, two-hand pinch to zoom.
 
-### 8. Personal Productivity Suite (`sentry_personal.py`)
+### 8. Generated 3D Assets (`services/asset_generator.py`, `web_gui/asset_viewer.js`)
+- **Text-to-3D via Tripo3D** — `generate_spatial_3d_asset` turns a description into a textured `.glb`. Requires `TRIPO_API_KEY`; without it the SVE still works and only this tool is unavailable.
+- **Never on the audio path** — generation takes tens of seconds, so the tool returns instantly, mounts a card, and runs the poll loop as a background task. The card shows live progress and the model drops in when it lands, exactly like the widget generator.
+- **PBR viewer** — `GLTFLoader` with a `RoomEnvironment` image-based light plus cyan key and violet rim lights, orbit controls, and auto-framing (models arrive at arbitrary scale, so each is normalised to unit size and the camera fitted to it).
+- **Downloaded, not hotlinked** — the hub fetches the `.glb` server-side and saves it to `generated_assets/`, then serves it from `/assets`. The CDN sends no CORS headers and signs its URLs with an expiry, so a card pointed straight at it fails even though generation succeeded.
+- **Models persist** — every asset is content-addressed (`<slug>_<sha1>.glb`) and indexed in `friday_assets.json`. `list_3d_assets` shows what exists and `show_3d_asset` re-mounts one instantly for free, so asking for the same model twice never costs a second credit. Both are git-ignored; delete the two lines in `.gitignore` if you want them committed.
+- **Hand-gesture control, on by default** — a model takes gesture focus the moment it mounts and starts hand tracking itself, the way a live scene does. Pinch-drag to grab and move it, pinch empty space or open palm to orbit, two-hand pinch to zoom. The card carries the same **Hands** / **Reset view** pills as the spatial card, and fills the available height (`min(62vh, 560px)`) rather than a fixed box. `gestures.js` now resolves a *target* rather than calling `window.SVE` directly, and a focused card implements the same surface (`pickAt` / `select` / `moveSelectedTo` / `orbitCamera` / `dollyCamera` / `commitSelectedMove` / `register+unregisterInputSource`). With no card focused the target is the SVE, exactly as before. The gesture cursor and HUD move into the focused card and back on release.
+- **Context-safe** — every card owns a WebGL context and browsers cap those, so dismissing a card disposes its renderer, geometry, and textures.
+
+**This is not a replacement for the SVE.** A generated asset is one photoreal object: no ids, no labels, no edits, ~a minute, and a credit per call. Anything structural or editable — molecules, orbits, flowcharts, anatomy, data — stays an SVE scene, which is instant, free, and updatable. The persona instruction and the tool description both enforce that split.
+
+### 9. Personal Productivity Suite (`sentry_personal.py`)
 - **EventKit calendars** via PyObjC across iCloud, Google, and Exchange.
 - **Apple Mail** via AppleScript — read recent mail, search sender/subject.
 
-### 9. Zero-Trust Remote Access (`setup_remote.sh`, Tailscale)
+### 10. Zero-Trust Remote Access (`setup_remote.sh`, Tailscale)
 - The hub binds only to `127.0.0.1`; remote access is tunnelled through Tailscale Serve HTTPS.
 - **Human-in-the-loop approvals** — while a remote client is connected, every shell and AppleScript call suspends for one-tap approval with a 45-second auto-deny.
 - **Smart sensor routing** — the phone's mic and camera become the primary senses; the unattended Mac's webcam and screen are left alone unless asked for explicitly.
@@ -222,7 +247,7 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 
 ## 🛠️ Tool Registry
 
-**34 native tool functions** exposed to the model:
+**38 native tool functions** exposed to the model:
 
 | Category | Tools |
 |---|---|
@@ -230,6 +255,7 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 | **Vision & Sensors** | `look_at_screen`, `look_at_webcam`, `start_camera_stream`, `stop_camera_stream`, `start_screen_stream`, `stop_screen_stream` |
 | **Biometrics & Memory** | `register_person`, `identify_current_user`, `save_memory_fact`, `retrieve_memory_facts` |
 | **Spatial 3D Engine** | `create_3d_scene`, `update_3d_scene`, `inspect_3d_scene`, `list_3d_scenes`, `delete_3d_scene` |
+| **Generated 3D Assets** | `generate_spatial_3d_asset`, `list_3d_assets`, `show_3d_asset`, `show_3d_view` |
 | **Widget Deck** | `create_skeleton_widget`, `dismiss_widget`, `clear_all_widgets` |
 | **Delegation** | `dispatch_agent` |
 | **Productivity & Web** | `get_calendar_events`, `create_calendar_event`, `get_recent_emails`, `search_emails`, `fetch_webpage` |
@@ -290,6 +316,10 @@ GEMINI_MODEL=gemini-3.1-flash-live-preview
 # FRIDAY's voice: Aoede (default) or Kore — both feminine.
 # Charon and Puck are masculine and will not match her persona.
 FRIDAY_VOICE=Aoede
+
+# Optional — Tripo3D text-to-3D. Without it only generate_spatial_3d_asset
+# is unavailable; SVE scenes are unaffected. Key: https://platform.tripo3d.ai
+TRIPO_API_KEY=your_tripo_api_key_here
 ```
 
 ### 5. Running FRIDAY

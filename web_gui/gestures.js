@@ -67,7 +67,11 @@ function reportPointedObject(hit) {
   }
   if (id && id !== reportedId && now - hoverSince > 600) {
     reportedId = id;
-    const entry = window.SVE.state.workspace[window.SVE.state.activeSceneId];
+    // Only an SVE scene has a workspace to report against — a focused asset
+    // card is a single mesh the hub tracks nothing about.
+    const sve = window.SVE;
+    if (T() !== sve || !sve?.state) return;
+    const entry = sve.state.workspace[sve.state.activeSceneId];
     window.sveSend?.({
       type: "sve_user_action",
       scene_id: entry?.spec.id,
@@ -221,7 +225,9 @@ function dismissHelperHint() {
 }
 
 function updateCursor(ndcX, ndcY, mode) {
-  const viewport = document.getElementById("sve-viewport");
+  // The focused card supplies its own element, so the cursor lands over the
+  // model being manipulated rather than the parked SVE stage.
+  const viewport = T()?.viewportEl?.() || document.getElementById("sve-viewport");
   if (!cursorEl || !viewport) return;
   const rect = viewport.getBoundingClientRect();
   cursorEl.style.display = "block";
@@ -234,9 +240,21 @@ function hideCursor() {
   if (cursorEl) cursorEl.style.display = "none";
 }
 
+// ---------- Gesture target ----------
+// Hand tracking drives whichever surface has focus: a generated-asset card when
+// one is focused, the SVE scene otherwise. Both expose the same small surface
+// (pickAt / select / moveSelectedTo / orbitCamera / dollyCamera /
+// commitSelectedMove / register+unregisterInputSource), so nothing below needs
+// to know which it is talking to.
+function T() {
+  const av = window.FridayAssetViewer;
+  if (av?.focusedId && av.has(av.focusedId)) return av.gestureTarget;
+  return window.SVE;
+}
+
 const inputSource = {
   update() {
-    if (!running || !video || video.readyState < 2 || !window.SVE) return;
+    if (!running || !video || video.readyState < 2 || !T()) return;
     if (video.currentTime === lastVideoTime) return;
     lastVideoTime = video.currentTime;
 
@@ -267,7 +285,7 @@ const inputSource = {
       const span = dist2d(hands[0][8], hands[1][8]);
       if (lastPinchSpan != null && span > 0.01) {
         const factor = lastPinchSpan / span;
-        window.SVE.dollyCamera(Math.max(0.9, Math.min(1.1, factor)));
+        T().dollyCamera(Math.max(0.9, Math.min(1.1, factor)));
       }
       lastPinchSpan = span;
       setHud("", false);
@@ -290,9 +308,9 @@ const inputSource = {
 
     if (pinch) {
       if (!grabbing && !orbiting) {
-        const hit = window.SVE.pickAt(nx, ny);
+        const hit = T().pickAt(nx, ny);
         if (hit) {
-          window.SVE.select(hit);
+          T().select(hit);
           grabbing = true;
         } else {
           orbiting = true;
@@ -300,11 +318,11 @@ const inputSource = {
         }
       }
       if (grabbing) {
-        window.SVE.moveSelectedTo(nx, ny);
+        T().moveSelectedTo(nx, ny);
         updateCursor(nx, ny, "grab");
-        setHud(window.SVE.selected?.userData.spec.label || window.SVE.selected?.userData.spec.id || "", true);
+        setHud(T().selected?.userData.spec.label || T().selected?.userData.spec.id || "", true);
       } else if (orbiting && lastOrbit) {
-        window.SVE.orbitCamera((nx - lastOrbit.x) * 2.2, (ny - lastOrbit.y) * 1.6);
+        T().orbitCamera((nx - lastOrbit.x) * 2.2, (ny - lastOrbit.y) * 1.6);
         lastOrbit = { x: nx, y: ny };
         updateCursor(nx, ny, "orbit");
         setHud("", false);
@@ -317,7 +335,7 @@ const inputSource = {
 
     if (palm) {
       if (lastOrbit) {
-        window.SVE.orbitCamera((nx - lastOrbit.x) * 2.2, (ny - lastOrbit.y) * 1.6);
+        T().orbitCamera((nx - lastOrbit.x) * 2.2, (ny - lastOrbit.y) * 1.6);
       }
       lastOrbit = { x: nx, y: ny };
       updateCursor(nx, ny, "orbit");
@@ -328,7 +346,7 @@ const inputSource = {
 
     if (isPointing(lm)) {
       updateCursor(nx, ny, "point");
-      const hit = window.SVE.pickAt(nx, ny);
+      const hit = T().pickAt(nx, ny);
       reportPointedObject(hit);
       setHud(hit ? (hit.userData.spec.label || hit.userData.spec.id) : "", !!hit);
       return;
@@ -342,7 +360,7 @@ const inputSource = {
 
 function endGrab() {
   if (grabbing) {
-    window.SVE.commitSelectedMove();
+    T().commitSelectedMove();
     grabbing = false;
   }
 }
@@ -369,7 +387,7 @@ async function startHands() {
     smoothing = null;
     hintDismissed = false;
     running = true;
-    window.SVE.registerInputSource(inputSource);
+    T().registerInputSource(inputSource);
     if (overlayEl) overlayEl.style.display = "block";
     btn?.classList.add("active");
     showHelperHint();
@@ -396,7 +414,7 @@ function stopHands() {
   }
   if (!running) return;
   running = false;
-  window.SVE.unregisterInputSource(inputSource);
+  detachInputSource();
   endGrab();
   if (video) {
     video.pause();
@@ -410,6 +428,21 @@ function stopHands() {
   setHud("", false);
   notifyState();
 }
+
+function detachInputSource() {
+  window.SVE?.unregisterInputSource?.(inputSource);
+  window.FridayAssetViewer?.gestureTarget?.unregisterInputSource?.(inputSource);
+}
+
+// Our tick is driven by the render loop of whatever we are pointed at, so when
+// focus moves between a card and the scene the registration has to move too —
+// otherwise the loop that was ticking us is disposed and tracking silently
+// freezes while still holding the camera.
+window.addEventListener("friday-asset-focus", () => {
+  if (!running) return;
+  detachInputSource();
+  T()?.registerInputSource?.(inputSource);
+});
 
 btn?.addEventListener("click", () => (running ? stopHands() : startHands()));
 

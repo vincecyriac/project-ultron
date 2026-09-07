@@ -5,6 +5,7 @@ import re
 import json
 import time
 import uuid
+import hashlib
 import asyncio
 import pyaudio
 import cv2
@@ -38,6 +39,7 @@ import sentry_personal
 import sentry_scene
 import friday_agents
 import widget_generator_agent
+import services.asset_generator
 
 # Load environment variables
 load_dotenv()
@@ -718,6 +720,8 @@ COMPONENT_TYPES = (
     "web_frame",       # embedded live web page with a browser HUD
 )
 SPATIAL_TYPE = "3d_spatial"     # mounted by the GUI itself, not by the model
+ASSET_TYPE = "3d_asset"         # a generated .glb, rendered by asset_viewer.js
+SPATIAL_WIDGET_ID = "spatial"   # the id the GUI gives its live scene card
 
 active_widgets = {}             # widget_id -> {id, type, title, components}
 WIDGET_LIMIT = 8
@@ -902,6 +906,174 @@ async def _hydrate_widget(widget_id: str, title: str, query_context: str):
                      "name": "agent:widget",
                      "result_preview": f"{title}: {len(html)} bytes"})
     log_info(f"Widget '{title}' hydrated ({len(html)} bytes).")
+
+
+def generate_spatial_3d_asset(prompt: str, widget_id: str = "", title: str = "") -> str:
+    """Mount a card now, generate the .glb in the background.
+
+    Tripo3D takes tens of seconds. Awaiting that here would hold the tool
+    response open and stall the whole Live turn, so this follows
+    create_skeleton_widget: the card appears immediately and the model drops
+    into it when it lands.
+    """
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return "Tell me what to model — I need a description of the object."
+
+    widget_id = (widget_id or "").strip() or f"a_{uuid.uuid4().hex[:6]}"
+    title = (title or prompt)[:48].strip()
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    widget = {"id": widget_id, "type": ASSET_TYPE, "title": title,
+              "status": "loading", "prompt": prompt, "asset_url": "",
+              "progress": 0, "components": []}
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create", "widget": widget})
+
+    task = asyncio.create_task(_generate_asset(widget_id, title, prompt))
+    active_agent_tasks.add(task)
+    task.add_done_callback(active_agent_tasks.discard)
+
+    log_info(f"3D asset '{title}' dispatched to Tripo3D.")
+    return ("The card is up and the model is rendering — it can take up to a minute. "
+            "Say one short line now; never wait for it.")
+
+
+def asset_widget_id(filename: str) -> str:
+    """Stable card id for a saved model, so re-showing it replaces its card."""
+    stem = os.path.splitext(filename or "")[0].lower()
+    return "asset_" + (re.sub(r"[^a-z0-9]+", "_", stem).strip("_")[:40] or "model")
+
+
+def list_3d_assets() -> str:
+    """What has already been generated, newest first."""
+    index = _load_asset_index()
+    if not index:
+        return "No 3D models saved yet."
+    lines = [f"{r.get('title') or r['file']} — {r.get('created', '?')}" for r in index[:20]]
+    return f"{len(index)} saved model(s), newest first: " + "; ".join(lines)
+
+
+SCENE_WORDS = ("spatial", "scene", "sve", "diagram", "workspace", "three")
+
+
+def show_3d_view(target: str = "") -> str:
+    """Bring one 3D surface to the front of the 3D tab.
+
+    The tab holds scenes and generated models side by side and shows one at a
+    time, so switching is its own action — nothing else moves the selection.
+    """
+    t = (target or "").strip().lower()
+    if not t:
+        return "Which one — the spatial scene, or a model by name?"
+
+    if any(w in t for w in SCENE_WORDS):
+        if SPATIAL_WIDGET_ID not in active_widgets:
+            return "No spatial scene is on stage. Build one with dispatch_agent tier 'spatial'."
+        broadcast_event({"type": "widget_action", "action": "activate_model",
+                         "widget_id": SPATIAL_WIDGET_ID})
+        log_info("Switched the 3D tab to the spatial scene.")
+        return "Spatial scene is up. Say one short line."
+
+    return show_3d_asset(t)
+
+
+def show_3d_asset(query: str, widget_id: str = "") -> str:
+    """Re-mount an already-generated model. Instant and free — no API call."""
+    query = (query or "").strip().lower()
+    index = _load_asset_index()
+    if not index:
+        return "No 3D models saved yet. Generate one with generate_spatial_3d_asset."
+
+    record = None
+    if query:
+        for r in index:                     # newest first, so first hit is freshest
+            haystack = f"{r.get('title', '')} {r.get('prompt', '')} {r.get('file', '')}".lower()
+            if query in haystack or all(w in haystack for w in query.split()):
+                record = r
+                break
+    else:
+        record = index[0]
+
+    if record is None:
+        titles = ", ".join(r.get("title") or r["file"] for r in index[:8])
+        return f"Nothing saved matches '{query}'. Saved: {titles}."
+
+    path = os.path.join(ASSETS_DIR, record["file"])
+    if not os.path.exists(path):
+        return f"'{record.get('title')}' is in the index but its file is missing."
+
+    # Derived from the file, not random: asking for the same model twice must
+    # reuse its card rather than stacking another pill onto the 3D tab.
+    widget_id = (widget_id or "").strip() or asset_widget_id(record["file"])
+    title = record.get("title") or record["file"]
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    widget = {"id": widget_id, "type": ASSET_TYPE, "title": title,
+              "status": "ready", "prompt": record.get("prompt", ""),
+              "asset_url": f"/assets/{record['file']}", "progress": 100,
+              "components": []}
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create", "widget": widget})
+    # Already-mounted cards are patched in place by the GUI, so ask for it to be
+    # raised explicitly rather than relying on a fresh mount to do it.
+    broadcast_event({"type": "widget_action", "action": "activate_model",
+                     "widget_id": widget_id})
+    log_info(f"Re-mounted saved 3D asset '{title}'.")
+    return f"'{title}' is back on screen. Say one short line."
+
+
+async def _generate_asset(widget_id: str, title: str, prompt: str):
+    """Resolve the .glb and patch it into its card. Never raises into the task."""
+    broadcast_event({"type": "tool_activity", "phase": "start",
+                     "name": "agent:3d", "args_preview": title})
+    url = ""
+    error = ""
+
+    def _progress(pct: int):
+        widget = active_widgets.get(widget_id)
+        if widget is None:
+            return
+        widget["progress"] = pct
+        broadcast_event({"type": "widget_action", "action": "patch_asset",
+                         "widget_id": widget_id, "status": "loading",
+                         "progress": pct})
+
+    local_url = ""
+    try:
+        url = await services.asset_generator.generate_mesh_asset(
+            prompt, on_progress=_progress)
+        # Pull the bytes down and keep them. The card then loads from us rather
+        # than the CDN, and the model is still here next session.
+        body = await _download_model(url)
+        record = save_generated_asset(prompt, title, body)
+        local_url = f"/assets/{record['file']}"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        error = str(e)
+        log_info(f"3D generation failed for '{title}': {e}")
+
+    widget = active_widgets.get(widget_id)
+    if widget is None:          # dismissed while it was still generating
+        broadcast_event({"type": "tool_activity", "phase": "done",
+                         "name": "agent:3d", "result_preview": "dismissed"})
+        return
+
+    widget["asset_url"] = local_url
+    widget["error"] = error
+    widget["status"] = "ready" if local_url else "failed"
+
+    broadcast_event({"type": "widget_action", "action": "patch_asset",
+                     "widget_id": widget_id, "asset_url": local_url,
+                     "status": widget["status"], "error": error})
+    broadcast_event({"type": "tool_activity", "phase": "done", "name": "agent:3d",
+                     "result_preview": (f"{title}: ready" if local_url
+                                        else f"{title}: {error or 'failed'}")})
+    log_info(f"3D asset '{title}' " + (f"ready at {local_url}" if local_url
+                                       else f"failed: {error}"))
 
 
 def esc_html(text: str) -> str:
@@ -1171,6 +1343,16 @@ async def execute_tool(name: str, args: dict) -> tuple:
     elif name == "create_skeleton_widget":
         result = create_skeleton_widget(args.get("widget_id", ""), args.get("title", ""),
                                         args.get("query_context", ""))
+    elif name == "generate_spatial_3d_asset":
+        result = generate_spatial_3d_asset(args.get("prompt", ""),
+                                           args.get("widget_id", ""),
+                                           args.get("title", ""))
+    elif name == "list_3d_assets":
+        result = list_3d_assets()
+    elif name == "show_3d_view":
+        result = show_3d_view(args.get("target", ""))
+    elif name == "show_3d_asset":
+        result = show_3d_asset(args.get("query", ""), args.get("widget_id", ""))
     elif name == "dismiss_widget":
         result = dismiss_widget(args.get("widget_id", ""))
     elif name == "clear_all_widgets":
@@ -1541,6 +1723,95 @@ TOOL_FUNCTION_DECLARATIONS = [
                         }
                     },
                     {
+                        "name": "list_3d_assets",
+                        "description": (
+                            "List the 3D models already generated and saved on disk, newest "
+                            "first. Check here before generating: re-showing a saved model is "
+                            "instant and free, while generating costs a credit and a minute."
+                        ),
+                        "parameters": {"type": "OBJECT", "properties": {}}
+                    },
+                    {
+                        "name": "show_3d_view",
+                        "description": (
+                            "Switch which 3D surface is on screen. The 3D tab holds the spatial "
+                            "scene and every generated model side by side but shows ONE at a time, "
+                            "so this is the only way to change the selection. Pass 'spatial' (or "
+                            "'scene') for the SVE scene, or a model's name to bring that model up. "
+                            "Use it whenever Vince says 'switch to', 'go back to', or 'show me the "
+                            "... instead'."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "target": {
+                                    "type": "STRING",
+                                    "description": "'spatial' for the SVE scene, or words naming a generated model, e.g. 'jet engine'."
+                                }
+                            },
+                            "required": ["target"]
+                        }
+                    },
+                    {
+                        "name": "show_3d_asset",
+                        "description": (
+                            "Put an already-generated 3D model back on screen. Instant and free — "
+                            "no API call. Use whenever Vince refers to a model made earlier "
+                            "('show me that drone again', 'bring back the jet engine'). Matches on "
+                            "title and on the prompt it was built from."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "query": {
+                                    "type": "STRING",
+                                    "description": "Words identifying the saved model, e.g. 'jet engine'. Omit for the most recent."
+                                },
+                                "widget_id": {
+                                    "type": "STRING",
+                                    "description": "Optional stable card id."
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "generate_spatial_3d_asset",
+                        "description": (
+                            "Generate ONE photoreal, textured 3D object (.glb) from a description "
+                            "and mount it in the deck, orbitable by hand. Use this when Vince wants "
+                            "to SEE a real thing — a drone, an engine part, a piece of furniture, a "
+                            "prop. It returns INSTANTLY; the model renders into the card up to a "
+                            "minute later, so keep talking and never wait for it. This is NOT for "
+                            "diagrams: anything structural, labelled or editable — molecules, orbits, "
+                            "flowcharts, networks, anatomy, data — belongs in a 3D scene via "
+                            "dispatch_agent tier 'spatial', which is instant, free and can be "
+                            "updated afterwards. Each call costs an API credit, so one asset per ask."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "prompt": {
+                                    "type": "STRING",
+                                    "description": (
+                                        "Vivid, concrete description of the single object, including "
+                                        "material and finish. E.g. 'vintage brass astrolabe with "
+                                        "engraved rings, studio lighting'. Describe one object, not a "
+                                        "scene or an arrangement."
+                                    )
+                                },
+                                "widget_id": {
+                                    "type": "STRING",
+                                    "description": "Stable id for the subject, e.g. 'drone_model'. Reuse it to replace that card."
+                                },
+                                "title": {
+                                    "type": "STRING",
+                                    "description": "Card header, e.g. 'Recon Drone'."
+                                }
+                            },
+                            "required": ["prompt"]
+                        }
+                    },
+                    {
                         "name": "create_skeleton_widget",
                         "description": (
                             "Put a data card on screen. Use this for ANY answer carrying detail "
@@ -1753,6 +2024,81 @@ async def receive_audio_task(session, session_disconnect_event):
 IMAGE_MAX_BYTES = 6 * 1024 * 1024
 _image_cache = {}          # url -> (bytes, content_type)
 
+MODEL_MAX_BYTES = 64 * 1024 * 1024      # generated .glb files run to tens of MB
+ASSETS_DIR = os.path.join(BASE_DIR, "generated_assets")
+ASSETS_INDEX_FILE = os.path.join(BASE_DIR, "friday_assets.json")
+
+
+def _load_asset_index() -> list:
+    try:
+        with open(ASSETS_INDEX_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_asset_index(index: list):
+    try:
+        with open(ASSETS_INDEX_FILE, "w", encoding="utf-8") as f:
+            json.dump(index[:200], f, indent=2)
+    except OSError as e:
+        log_info(f"Could not write the asset index: {e}")
+
+
+async def _download_model(url: str) -> bytes:
+    """Fetch a generated .glb server-side.
+
+    This has to happen on our side rather than in the page: the CDN serves the
+    file without CORS headers, so the browser refuses it outright, and the URL
+    is signed and expires. Downloading once and keeping the bytes sidesteps both.
+    """
+    import aiohttp
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "model/gltf-binary,application/octet-stream,*/*",
+    }
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector,
+                                     headers=headers) as session:
+        async with session.get(url) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"the model host answered HTTP {resp.status}")
+            # read(n) returns only what is already buffered, which silently
+            # truncates anything bigger than one chunk — iterate to EOF instead.
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                buf.extend(chunk)
+                if len(buf) > MODEL_MAX_BYTES:
+                    raise RuntimeError("the model is larger than 64 MB")
+
+    body = bytes(buf)
+    if not body.startswith(b"glTF"):
+        raise RuntimeError("the downloaded file is not a .glb")
+    return body
+
+
+def save_generated_asset(prompt: str, title: str, body: bytes) -> dict:
+    """Write the .glb into generated_assets/ and record it in the index."""
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "_", (title or "asset").lower()).strip("_")[:40] or "asset"
+    # Content-addressed, so regenerating the same model never duplicates it.
+    digest = hashlib.sha1(body).hexdigest()[:8]
+    filename = f"{slug}_{digest}.glb"
+
+    with open(os.path.join(ASSETS_DIR, filename), "wb") as f:
+        f.write(body)
+
+    record = {"file": filename, "title": title, "prompt": prompt,
+              "bytes": len(body), "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+    index = [r for r in _load_asset_index() if r.get("file") != filename]
+    index.insert(0, record)
+    _save_asset_index(index)
+    log_info(f"Saved 3D asset to generated_assets/{filename} ({len(body)} bytes).")
+    return record
+
 
 async def start_gui_server():
     """Serves web_gui over HTTP so ES modules (Three.js) load reliably."""
@@ -1826,6 +2172,9 @@ async def start_gui_server():
     app = web.Application(middlewares=[no_store_frontend])
     app.router.add_get("/", index)
     app.router.add_get("/img", image_proxy)
+    # Saved .glb files, served same-origin so the loader can read them.
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    app.router.add_static("/assets", path=ASSETS_DIR)
     app.router.add_static("/", path=gui_dir)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1939,6 +2288,16 @@ def build_system_instruction(memory_str: str) -> str:
         "say one short line in the same turn. Never say you cannot do it, never ask what to build. "
         "The result comes back and you announce it in under 10 words. Quick things you do yourself: "
         "a single tool call, a lookup, a widget update, a scene edit. "
+        "TWO KINDS OF 3D — pick deliberately. A single real OBJECT he wants to look at (a "
+        "drone, an engine part, a chair) is generate_spatial_3d_asset: photoreal, textured, "
+        "orbitable, takes up to a minute and costs a credit. Anything structural, labelled or "
+        "editable — molecules, orbits, flowcharts, networks, anatomy, data — is an SVE scene: "
+        "instant, free, and updatable afterwards. If it needs labels or later edits, it is a scene. "
+        "The 3D tab shows one surface at a time — scene or model. Changing which one is visible "
+        "is always show_3d_view; nothing else moves that selection, so never claim you "
+        "switched without calling it. "
+        "Generated models are saved to disk and persist across restarts: if he refers to one you "
+        "made before, use show_3d_asset (instant, free) rather than generating it again. "
         "3D SCENES: building a new scene is always dispatch_agent tier 'spatial' — never "
         "create_3d_scene yourself. Editing one already on stage ('rotate it', 'highlight X', 'hide "
         "Y') is a direct update_3d_scene call. Scenes persist; never rebuild one to change it. "

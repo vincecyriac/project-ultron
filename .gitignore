@@ -14,6 +14,10 @@ friday_history.jsonl
 friday_memory.json
 friday_profiles.json
 friday_scenes.json
+friday_assets.json
+
+# Generated 3D models (binary, regenerable — remove these two lines to commit them)
+generated_assets/
 
 # Temporary media captures
 *.jpg

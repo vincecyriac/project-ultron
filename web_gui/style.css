@@ -415,6 +415,80 @@ body.widgets-active .workspace {
   transform: scale(1);
 }
 
+/* ---------- Workspace tabs ----------
+   Two panes: cards stack and scroll, 3D shows exactly one model at full height. */
+.workspace { display: flex; flex-direction: column; gap: 10px; }
+
+.deck-tabs { display: flex; gap: 8px; flex-shrink: 0; }
+
+.deck-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 13px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-line);
+  background: var(--glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: var(--text-dim);
+  font-family: var(--font);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+.deck-tab svg { width: 14px; height: 14px; }
+.deck-tab:hover { color: var(--text); }
+.deck-tab.active {
+  color: var(--cyan);
+  border-color: var(--cyan-line);
+  background: rgba(0, 242, 254, 0.08);
+}
+.deck-tab-n {
+  min-width: 17px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+}
+.deck-tab.active .deck-tab-n { background: rgba(0, 242, 254, 0.18); }
+
+/* Only the selected pane occupies the workspace. */
+.deck-panes { flex: 1; min-height: 0; position: relative; }
+body[data-deck-tab="models"] .widget-deck { display: none; }
+body:not([data-deck-tab="models"]) .model-deck { display: none; }
+
+.model-deck { display: flex; flex-direction: column; gap: 10px; height: 100%; min-height: 0; }
+.model-pills { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
+.model-slot { flex: 1; min-height: 0; position: relative; }
+
+.model-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+/* Hidden models stay mounted (context and camera intact) but take no space. */
+.widget.model-hidden { display: none !important; }
+
+/* Both 3D cards fill the slot and are chrome-identical: the pills above name
+   them, so neither carries its own header. */
+.model-slot > .widget {
+  height: 100%;
+  padding: 0;
+  animation: none;
+}
+.model-slot > .widget > .widget-head { display: none; }
+.model-slot > .widget > .widget-body { flex: 1; min-height: 0; padding: 0; gap: 0; overflow: hidden; }
+
 .widget-deck {
   display: flex;
   flex-direction: column;
@@ -553,6 +627,91 @@ body.widgets-active .workspace {
 
 .widget.loading { border-color: rgba(0, 242, 254, 0.28); }
 .widget.failed  { border-color: rgba(229, 114, 111, 0.3); }
+
+/* ---- Generated 3D asset card --------------------------------------------
+   The stage hosts a live WebGL canvas from asset_viewer.js; while Tripo works,
+   a ring and a progress bar stand in so the wait reads as progress, not a hang. */
+.asset-stage {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgba(0, 242, 254, 0.07), transparent 70%),
+    rgba(7, 10, 15, 0.55);
+  cursor: grab;
+}
+.asset-stage:active { cursor: grabbing; }
+
+/* The generated-asset card mirrors the 3D spatial card: one tall stage that
+   fills the available height, with floating pill controls over it. */
+.widget[data-type="3d_asset"] > .widget-body { flex: 1; min-height: 0; padding: 0; gap: 0; }
+
+.asset-wrap { position: relative; height: 100%; min-height: 0; }
+
+/* Same placement as .sve-controls, so both 3D cards read as one family. */
+.asset-controls {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 24px);
+  opacity: 0.75;
+  transition: opacity 0.2s ease;
+}
+.asset-wrap:hover .asset-controls { opacity: 1; }
+
+/* The card hand tracking is currently driving. */
+.widget.gesture-focused { border-color: rgba(0, 242, 254, 0.45); }
+.widget.gesture-focused .asset-stage { cursor: none; }
+.asset-stage canvas { display: block; width: 100%; height: 100%; }
+
+.asset-loading {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+
+.asset-orbit {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(0, 242, 254, 0.18);
+  border-top-color: var(--cyan);
+  animation: asset-spin 1.1s linear infinite;
+}
+@keyframes asset-spin { to { transform: rotate(360deg); } }
+
+.asset-caption {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.asset-bar {
+  width: 60%;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(0, 242, 254, 0.12);
+  overflow: hidden;
+}
+.asset-bar span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--cyan), #A18CD1);
+  transition: width 0.5s var(--ease-spatial);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .asset-orbit { animation: none; }
+  .asset-bar span { transition: none; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .skeleton-shimmer { animation: none; background-position: 50% 0; }
@@ -1073,7 +1232,6 @@ body.widgets-active .workspace {
 
 /* ---------- 3D spatial widget ---------- */
 
-.widget[data-type="3d_spatial"] { padding: 0; height: min(62vh, 560px); }
 /* The 3D card names itself with its scene pill and carries its own control
    bar, so the generic card header would only collide with them. */
 .widget[data-type="3d_spatial"] > .widget-head { display: none; }

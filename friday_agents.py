@@ -7,9 +7,9 @@ and dispatches a goal here, where a specialised model grinds through the tool
 loop off the audio path.
 
 Tiers
-  os       gemini-3.1-pro-preview  — macOS automation, AppleScript, shell,
+  os       gemini-3.8-flash  — macOS automation, AppleScript, shell,
                                      multi-step GUI control and system logic.
-  spatial  gemini-3.7-flash        — fast structured JSON: 3D scene deltas for
+  spatial  gemini-3.8-flash        — fast structured JSON: 3D scene deltas for
                                      the SVE, screen-coordinate denormalisation.
 
 The agent reuses the hub's own tool implementations: execute_tool is injected
@@ -21,8 +21,8 @@ import json
 
 from google.genai import types
 
-OS_AGENT_MODEL = "gemini-3.1-pro-preview"
-SVE_AGENT_MODEL = "gemini-3.7-flash"
+OS_AGENT_MODEL = "gemini-3.8-flash"
+SVE_AGENT_MODEL = "gemini-3.8-flash"
 
 MAX_STEPS = 12          # tool round-trips before the agent must conclude
 STEP_TIMEOUT_S = 120.0  # per model call

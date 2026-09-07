@@ -52,6 +52,10 @@ const screenFeedCard = document.getElementById("screen-feed-card");
 const pipStackEl = document.querySelector(".pip-stack");
 const agentRailEl = document.getElementById("agent-rail");
 const widgetDeckEl = document.getElementById("widget-deck");
+const modelSlotEl = document.getElementById("model-slot");
+const modelPillsEl = document.getElementById("model-pills");
+const modelEmptyEl = document.getElementById("model-empty");
+const deckTabsEl = document.getElementById("deck-tabs");
 const sveStageEl = document.getElementById("sve-stage");
 const sveParkingEl = document.getElementById("sve-parking");
 
@@ -392,6 +396,15 @@ function handleServerMessage(msg) {
         case "patch_content":
           hydrateWidget(msg.widget_id, msg.html, msg.status);
           break;
+        case "activate_model":
+          if (widgets.has(msg.widget_id)) {
+            setActiveModel(msg.widget_id);
+            setActiveTab("models");
+          }
+          break;
+        case "patch_asset":
+          patchAsset(msg.widget_id, msg);
+          break;
         case "update":  patchWidget(msg.widget_id, msg.components); break;
         case "dismiss": dismissWidgetLocal(msg.widget_id); break;
         case "clear_all": clearAllWidgetsLocal(); break;
@@ -446,19 +459,91 @@ const COMPONENT_ICONS = {
   media_view:     '<rect x="3" y="4" width="18" height="15" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M21 16l-5-5-6 6"/>',
   progress_gauge: '<rect x="3" y="3" width="18" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
   "3d_spatial":   '<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 12l9-5M12 12v10M12 12L3 7"/>',
+  "3d_asset":     '<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 12l9-5M12 12v10M12 12L3 7"/><circle cx="12" cy="12" r="2.6"/>',
 };
 
 function widgetIcon(spec) {
   if (spec.type === "3d_spatial") return COMPONENT_ICONS["3d_spatial"];
+  if (spec.type === "3d_asset") return COMPONENT_ICONS["3d_asset"];
   if (spec.type === "html") return COMPONENT_ICONS.metric_grid;
   const first = (spec.components || [])[0];
   return COMPONENT_ICONS[first && first.type] || COMPONENT_ICONS.feed_list;
 }
 
+// A 3D card — SVE scene or generated asset — lives in the models pane, where
+// exactly one is visible at a time. Everything else stacks in the cards pane.
+const MODEL_TYPES = new Set(["3d_spatial", "3d_asset"]);
+const isModelSpec = (spec) => MODEL_TYPES.has(spec && spec.type);
+
+let activeTab = "cards";
+let activeModelId = null;
+
+function modelEntries() {
+  return [...widgets.entries()].filter(([, w]) => isModelSpec(w.spec));
+}
+
+function setActiveTab(name) {
+  activeTab = name;
+  document.body.dataset.deckTab = name;
+  for (const b of deckTabsEl.querySelectorAll(".deck-tab")) {
+    b.classList.toggle("active", b.dataset.tab === name);
+  }
+  pumpRenderers();
+}
+
+/** Show exactly one 3D card; the rest stay mounted but hidden and paused. */
+function setActiveModel(id) {
+  const models = modelEntries();
+  if (!models.length) { activeModelId = null; renderModelPills(); return; }
+  if (!widgets.has(id) || !isModelSpec(widgets.get(id).spec)) {
+    id = models[models.length - 1][0];
+  }
+  activeModelId = id;
+
+  for (const [wid, w] of models) {
+    const on = wid === id;
+    w.el.classList.toggle("model-hidden", !on);
+    // A hidden card keeps its WebGL context but must stop rendering, or every
+    // model ever generated would keep burning a rAF loop behind the scenes.
+    if (w.spec.type === "3d_asset") window.FridayAssetViewer?.setVisible(wid, on);
+  }
+  // Hands follow the visible model. Without this the tracker stays pointed at
+  // the card that just went hidden, so gestures do nothing on the new one and
+  // its Hands button appears dead.
+  const activeSpec = widgets.get(id)?.spec;
+  applyGestureFocus(activeSpec?.type === "3d_asset" ? id : null);
+
+  renderModelPills();
+  pumpRenderers();
+}
+
+function renderModelPills() {
+  const models = modelEntries();
+  modelPillsEl.innerHTML = "";
+  modelEmptyEl.style.display = models.length ? "none" : "";
+  for (const [wid, w] of models) {
+    const b = document.createElement("button");
+    b.className = "sve-tab" + (wid === activeModelId ? " active" : "");
+    b.textContent = w.spec.title || wid;
+    b.title = w.spec.prompt || w.spec.title || wid;
+    b.onclick = () => setActiveModel(wid);
+    modelPillsEl.appendChild(b);
+  }
+}
+
+deckTabsEl.addEventListener("click", (e) => {
+  const b = e.target.closest(".deck-tab");
+  if (b) setActiveTab(b.dataset.tab);
+});
+
 function setDeckCount() {
   const n = widgets.size;
-  widgetDeckEl.dataset.count = String(n);
+  const models = modelEntries().length;
+  widgetDeckEl.dataset.count = String(n - models);
+  document.getElementById("tab-n-cards").textContent = String(n - models);
+  document.getElementById("tab-n-models").textContent = String(models);
   document.body.classList.toggle("widgets-active", n > 0);
+  renderModelPills();
   pumpRenderers();
 }
 
@@ -467,6 +552,7 @@ function mountWidget(spec) {
   if (entry) {                       // same id -> patch in place, never re-add
     entry.spec = spec;
     renderWidgetBody(entry);
+    if (isModelSpec(spec)) setActiveModel(spec.id);
     return;
   }
 
@@ -486,13 +572,149 @@ function mountWidget(spec) {
     sendWidgetAction("dismiss_widget", { widget_id: spec.id });
   });
 
-  // Newest on top: the card Vince just asked for should never appear below
-  // the fold behind older ones.
-  widgetDeckEl.prepend(el);
+  if (isModelSpec(spec)) {
+    // Models share one slot; only the active one is visible.
+    modelSlotEl.appendChild(el);
+  } else {
+    // Newest on top: the card Vince just asked for should never appear below
+    // the fold behind older ones.
+    widgetDeckEl.prepend(el);
+  }
   entry = { el, spec };
   widgets.set(spec.id, entry);
   renderWidgetBody(entry);
   setDeckCount();
+
+  // Show the pane the new thing landed in, and make a new model the visible one.
+  if (isModelSpec(spec)) {
+    setActiveModel(spec.id);
+    setActiveTab("models");
+  } else {
+    setActiveTab("cards");
+  }
+}
+
+// A generated .glb card: shimmer with progress while Tripo works, then hand the
+// model to asset_viewer.js. The viewer owns a WebGL context, so it is mounted
+// once per URL and always disposed on dismiss.
+function renderAssetBody(entry) {
+  const body = entry.el.querySelector(".widget-body");
+  const spec = entry.spec;
+
+  if (spec.status === "ready" && spec.asset_url) {
+    entry.el.classList.remove("loading");
+    let stage = body.querySelector(".asset-stage");
+    if (!stage) {
+      body.innerHTML =
+        '<div class="asset-wrap">'
+        + '<div class="asset-stage"></div>'
+        + '<div class="asset-controls">'
+        + '<button class="pill btn-asset-hands" title="Hand gesture control">'
+        + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+        + '<path d="M18 11V6a1.5 1.5 0 0 0-3 0"/><path d="M15 10.5V4a1.5 1.5 0 0 0-3 0v6.5"/>'
+        + '<path d="M12 10.5V5a1.5 1.5 0 0 0-3 0v7"/>'
+        + '<path d="M9 12V8.5a1.5 1.5 0 0 0-3 0V14a7 7 0 0 0 7 7h1a6 6 0 0 0 6-6v-3a1.5 1.5 0 0 0-3 0"/>'
+        + '</svg><span>Hands</span></button>'
+        + '<button class="pill btn-asset-reset" title="Reset camera">'
+        + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+        + '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>'
+        + '</svg><span>Reset view</span></button>'
+        + '</div></div>';
+      stage = body.querySelector(".asset-stage");
+      body.querySelector(".btn-asset-hands")
+          .addEventListener("click", () => toggleAssetGestureFocus(spec.id));
+      body.querySelector(".btn-asset-reset")
+          .addEventListener("click", () => window.FridayAssetViewer?.resetCamera(spec.id));
+    } else if (stage.dataset.url === spec.asset_url) {
+      return;                        // already showing this model, leave it be
+    }
+    stage.dataset.url = spec.asset_url;
+    // asset_url is a local /assets/... path: the hub downloads the .glb and
+    // saves it, so the loader never touches the CDN (which serves no CORS
+    // headers and signs its URLs with an expiry).
+    window.FridayAssetViewer?.mount(stage, spec.asset_url, spec.id, spec.title);
+    // Hands on by default — the model that just arrived is the one being asked
+    // about, so it takes gesture focus the way a live SVE scene does.
+    if (window.FridayAssetViewer?.focusedId !== spec.id) toggleAssetGestureFocus(spec.id);
+    return;
+  }
+
+  if (spec.status === "failed") {
+    window.FridayAssetViewer?.dispose(spec.id);
+    entry.el.classList.remove("loading");
+    body.innerHTML = '<div class="hud-note">Could not generate this model'
+      + (spec.error ? ` — ${esc(spec.error)}` : "") + ".</div>";
+    return;
+  }
+
+  entry.el.classList.add("loading");
+  const pct = Math.max(0, Math.min(100, Number(spec.progress) || 0));
+  body.innerHTML =
+    '<div class="asset-loading">'
+    + '<div class="asset-orbit"></div>'
+    + `<div class="asset-caption">Synthesizing ${esc(spec.title || "model")}…</div>`
+    + `<div class="asset-bar"><span style="width:${pct}%"></span></div>`
+    + '</div>';
+}
+
+// Hand tracking draws its cursor and HUD inside whatever it drives, so those
+// nodes move into the focused card and back to the SVE stage on release.
+function adoptGestureOverlay(dest) {
+  const home = document.getElementById("sve-stage");
+  const target = dest || home;
+  if (!target) return;
+  const cursor = document.getElementById("gesture-cursor");
+  const hud = document.getElementById("gesture-hud");
+  if (cursor) target.appendChild(cursor);
+  if (hud) target.appendChild(hud);
+}
+
+/** Point hand tracking at one asset card, or (id = null) back at the SVE scene.
+ *  focus() refuses an id with no live viewer, so the result is trusted over the
+ *  intent — otherwise a card whose model failed to load would show a focus ring
+ *  while gestures went nowhere. */
+function applyGestureFocus(id) {
+  const av = window.FridayAssetViewer;
+  if (!av) return false;
+  const got = id ? av.focus(id) === true : (av.focus(null), false);
+
+  adoptGestureOverlay(got ? widgets.get(id)?.el.querySelector(".asset-stage") : null);
+  for (const [wid, w] of widgets) {
+    const on = got && wid === id;
+    w.el.classList.toggle("gesture-focused", on);
+    w.el.querySelector(".btn-asset-hands")?.classList.toggle("active", on);
+  }
+
+  // Focus alone changes nothing without the tracker running: it owns the camera
+  // and the landmark loop.
+  syncGestureTracking();
+  return got;
+}
+
+/** Hand gestures drive one surface at a time: this card, or the SVE scene. */
+function toggleAssetGestureFocus(id) {
+  const av = window.FridayAssetViewer;
+  if (!av) return;
+  applyGestureFocus(av.focusedId === id ? null : id);
+}
+
+/** Run hand tracking iff something wants it: a focused card, or a live scene. */
+function syncGestureTracking() {
+  const g = window.FridayGestures;
+  if (!g) return;
+  const wanted = !!window.FridayAssetViewer?.focusedId || !!window.SVE?.hasActiveScene();
+  if (wanted && !g.running && !g.starting) g.start();
+  else if (!wanted && g.running) g.stop();
+}
+
+function patchAsset(id, msg) {
+  const entry = widgets.get(id);
+  if (!entry) return;
+  if (msg.status) entry.spec.status = msg.status;
+  if (msg.asset_url !== undefined) entry.spec.asset_url = msg.asset_url;
+  if (msg.error !== undefined) entry.spec.error = msg.error;
+  if (msg.progress !== undefined) entry.spec.progress = msg.progress;
+  renderWidgetBody(entry);
 }
 
 function patchWidget(id, components) {
@@ -505,16 +727,32 @@ function patchWidget(id, components) {
 function dismissWidgetLocal(id) {
   const entry = widgets.get(id);
   if (!entry) return;
+  if (entry.spec.type === "3d_asset") {
+    // Hand focus (and the overlay nodes) must go back to the SVE with the card.
+    if (window.FridayAssetViewer?.focusedId === id) {
+      window.FridayAssetViewer.focus(null);
+      adoptGestureOverlay(null);
+      window.FridayAssetViewer.dispose(id);
+      syncGestureTracking();          // nothing left wants the camera
+    }
+    window.FridayAssetViewer?.dispose(id);
+  }
   if (entry.spec.type === "3d_spatial") {
     parkSveStage();
     // The scenes have to go too, or the workspace watchdog sees a live scene
     // with no card and mounts it straight back.
     discardAllScenes();
   }
+  const wasModel = isModelSpec(entry.spec);
   entry.el.classList.add("leaving");
   widgets.delete(id);
   setTimeout(() => entry.el.remove(), 260);
   setDeckCount();
+  if (wasModel) {
+    // Promote whatever is left so the pane is never blank with models loaded.
+    setActiveModel(activeModelId === id ? null : activeModelId);
+    if (!modelEntries().length) setActiveTab("cards");
+  }
 }
 
 function clearAllWidgetsLocal() {
@@ -590,6 +828,7 @@ const COMPONENTS = {
 function renderWidgetBody(entry) {
   const body = entry.el.querySelector(".widget-body");
   if (entry.spec.type === "3d_spatial") { adoptSveStage(body); return; }
+  if (entry.spec.type === "3d_asset") { renderAssetBody(entry); return; }
 
   // Cards built by the background generator arrive as markup, and start life as
   // a shimmer so the deck responds the moment Vince asks rather than seconds later.
@@ -1448,13 +1687,9 @@ function syncGesturesToWorkspace() {
     sendWidgetAction("dismiss_widget", { widget_id: SVE_WIDGET_ID });
   }
 
-  const g = window.FridayGestures;
-  if (!g || !window.SVE) return;
-  if (hasScene) {
-    if (!g.running && !g.starting) g.start();
-  } else if (g.running) {
-    g.stop();
-  }
+  // Hand tracking is shared, so this may not switch it off just because the
+  // workspace emptied — a focused asset card may still be driving it.
+  syncGestureTracking();
 }
 const SVE_WIDGET_ID = "spatial";
 window.syncGesturesToWorkspace = syncGesturesToWorkspace;
